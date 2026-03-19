@@ -141,6 +141,23 @@ These counters should be updated:
 - after construction
 - after every call to `step`
 
+## `default_branching_literal()`
+
+`default_branching_literal()` returns the literal that MiniSAT itself would branch on next at the current pause point.
+
+Design rules:
+
+- if `state == 0`, the return value is either one of the literals in `candidates` or `None` if no branch is available
+- if `state` is `10` or `20`, the return value is `None`
+- calling `default_branching_literal()` must not mutate solver state, advance the search, consume heap entries, or change the random seed
+
+This method exists so a Python controller can exactly replay MiniSAT's own default branching policy by repeatedly calling:
+
+```python
+literal = solver.default_branching_literal()
+solver.step(literal)
+```
+
 ## `step(literal)`
 
 `step(literal: int)` applies one external branching choice and then lets MiniSAT run until the next externally visible pause point.

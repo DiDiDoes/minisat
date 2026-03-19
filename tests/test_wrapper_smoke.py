@@ -1,10 +1,65 @@
+import re
+import subprocess
+from pathlib import Path
+
 import minisat_wrapper
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXAMPLES_DIR = REPO_ROOT / "examples"
+NATIVE_SOLVER = REPO_ROOT / "build/release/bin/minisat_core"
+STAT_RE = re.compile(r"^(conflicts|decisions|propagations)\s*:\s*(\d+)", re.MULTILINE)
+
+
+def parse_dimacs(path: Path):
+    cnf = []
+    with path.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line[0] in {"c", "p"}:
+                continue
+            literals = [int(token) for token in line.split()]
+            clause = [literal for literal in literals if literal != 0]
+            cnf.append(clause)
+    return cnf
+
+
+def ensure_native_solver():
+    if NATIVE_SOLVER.exists():
+        return
+    subprocess.run(["make", "cr"], cwd=REPO_ROOT, check=True)
+
+
+def run_native_solver(path: Path):
+    ensure_native_solver()
+    proc = subprocess.run(
+        [str(NATIVE_SOLVER), str(path)],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    stats = {name: int(value) for name, value in STAT_RE.findall(proc.stdout)}
+    return proc.returncode, stats
+
+
+def run_wrapper_with_default_branching(path: Path):
+    solver = minisat_wrapper.MiniSAT(parse_dimacs(path))
+    while solver.state == minisat_wrapper.STATE_UNRESOLVED:
+        literal = solver.default_branching_literal()
+        assert literal in solver.candidates
+        solver.step(literal)
+    return solver.state, {
+        "conflicts": solver.conflicts,
+        "decisions": solver.decisions,
+        "propagations": solver.propagations,
+    }
 
 
 def test_unsat_construction():
     solver = minisat_wrapper.MiniSAT([[1], [-1]])
     assert solver.state == minisat_wrapper.STATE_UNSAT
     assert solver.candidates == []
+    assert solver.default_branching_literal() is None
 
 
 def test_sat_via_two_steps():
@@ -19,5 +74,41 @@ def test_sat_via_two_steps():
     solver.step(2)
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
-    assert solver.decisions == 2
+    assert solver.default_branching_literal() is None
+    assert solver.decisions == 3
     assert solver.propagations >= 0
+
+
+def test_default_branching_literal_replays_minisat_choice():
+    solver = minisat_wrapper.MiniSAT([[1, 2]])
+    literal = solver.default_branching_literal()
+
+    assert literal == -1
+    assert literal in solver.candidates
+
+    solver.step(literal)
+    assert solver.state == minisat_wrapper.STATE_SAT
+    assert solver.candidates == []
+    assert solver.default_branching_literal() is None
+    assert solver.decisions == 2
+
+
+def test_default_branching_matches_native_solver_on_sat_example():
+    path = EXAMPLES_DIR / "v5c24_sat.cnf"
+    native_status, native_stats = run_native_solver(path)
+    wrapper_state, wrapper_stats = run_wrapper_with_default_branching(path)
+
+    assert native_status == 10
+    assert wrapper_state == minisat_wrapper.STATE_SAT
+    assert wrapper_stats == native_stats
+
+
+
+def test_default_branching_matches_native_solver_on_unsat_example():
+    path = EXAMPLES_DIR / "v5c24_unsat.cnf"
+    native_status, native_stats = run_native_solver(path)
+    wrapper_state, wrapper_stats = run_wrapper_with_default_branching(path)
+
+    assert native_status == 20
+    assert wrapper_state == minisat_wrapper.STATE_UNSAT
+    assert wrapper_stats == native_stats

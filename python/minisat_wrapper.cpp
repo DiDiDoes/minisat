@@ -46,6 +46,17 @@ public:
         return propagations;
     }
 
+    py::object default_branching_literal() const {
+        if (state_ != kStateUnresolved)
+            return py::none();
+
+        const Minisat::Lit next = peek_default_branch_lit();
+        if (next == Minisat::lit_Undef)
+            return py::none();
+
+        return py::int_(encode_literal(next));
+    }
+
     void step(int literal) {
         if (state_ != kStateUnresolved)
             throw std::runtime_error("step() is only valid while the solver is unresolved");
@@ -63,9 +74,80 @@ private:
     std::vector<int> candidates_;
     bool search_initialized_ = false;
 
+    static int encode_literal(Minisat::Lit literal) {
+        const int variable = Minisat::var(literal) + 1;
+        return Minisat::sign(literal) ? -variable : variable;
+    }
+
     static Minisat::Lit make_literal_unchecked(int literal) {
         const int variable = std::abs(literal) - 1;
         return Minisat::mkLit(variable, literal < 0);
+    }
+
+    bool activity_lt(Minisat::Var left, Minisat::Var right) const {
+        return activity[left] > activity[right];
+    }
+
+    static int heap_left(int index) {
+        return index * 2 + 1;
+    }
+
+    static int heap_right(int index) {
+        return (index + 1) * 2;
+    }
+
+    void percolate_down_snapshot(std::vector<Minisat::Var>& heap, int index) const {
+        const Minisat::Var value_at_index = heap[static_cast<std::size_t>(index)];
+        while (heap_left(index) < static_cast<int>(heap.size())) {
+            int child = heap_left(index);
+            const int right = heap_right(index);
+            if (right < static_cast<int>(heap.size()) && activity_lt(heap[static_cast<std::size_t>(right)], heap[static_cast<std::size_t>(child)]))
+                child = right;
+            if (!activity_lt(heap[static_cast<std::size_t>(child)], value_at_index))
+                break;
+            heap[static_cast<std::size_t>(index)] = heap[static_cast<std::size_t>(child)];
+            index = child;
+        }
+        heap[static_cast<std::size_t>(index)] = value_at_index;
+    }
+
+    Minisat::Var remove_min_snapshot(std::vector<Minisat::Var>& heap) const {
+        const Minisat::Var minimum = heap.front();
+        heap.front() = heap.back();
+        heap.pop_back();
+        if (!heap.empty())
+            percolate_down_snapshot(heap, 0);
+        return minimum;
+    }
+
+    Minisat::Lit peek_default_branch_lit() const {
+        std::vector<Minisat::Var> heap_snapshot;
+        heap_snapshot.reserve(static_cast<std::size_t>(order_heap.size()));
+        for (int index = 0; index < order_heap.size(); ++index)
+            heap_snapshot.push_back(order_heap[index]);
+
+        Minisat::Var next = Minisat::var_Undef;
+        double seed = random_seed;
+
+        if (Minisat::Solver::drand(seed) < random_var_freq && !heap_snapshot.empty()) {
+            next = heap_snapshot[static_cast<std::size_t>(Minisat::Solver::irand(seed, static_cast<int>(heap_snapshot.size())))];
+        }
+
+        while (next == Minisat::var_Undef || value(next) != Minisat::l_Undef || !decision[next]) {
+            if (heap_snapshot.empty()) {
+                next = Minisat::var_Undef;
+                break;
+            }
+            next = remove_min_snapshot(heap_snapshot);
+        }
+
+        if (next == Minisat::var_Undef)
+            return Minisat::lit_Undef;
+        if (user_pol[next] != Minisat::l_Undef)
+            return Minisat::mkLit(next, user_pol[next] == Minisat::l_True);
+        if (rnd_pol)
+            return Minisat::mkLit(next, Minisat::Solver::drand(seed) < 0.5);
+        return Minisat::mkLit(next, polarity[next]);
     }
 
     Minisat::Lit decode_existing_literal(int literal) const {
@@ -207,6 +289,7 @@ private:
 
             refresh_candidates();
             if (candidates_.empty()) {
+                decisions++;
                 store_model();
                 state_ = kStateSat;
                 return;
@@ -230,6 +313,7 @@ PYBIND11_MODULE(minisat_wrapper, m) {
         .def_property_readonly("conflicts", &PyMiniSAT::conflicts_count)
         .def_property_readonly("decisions", &PyMiniSAT::decisions_count)
         .def_property_readonly("propagations", &PyMiniSAT::propagations_count)
+        .def("default_branching_literal", &PyMiniSAT::default_branching_literal)
         .def("step", &PyMiniSAT::step, py::arg("literal"));
 
     m.attr("STATE_UNRESOLVED") = py::int_(kStateUnresolved);
