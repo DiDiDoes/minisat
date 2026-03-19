@@ -48,11 +48,15 @@ typedef int Var;
 #endif
 
 
+struct Lit;
+inline Lit mkLit(Var var, bool sign = false);
+
+
 struct Lit {
     int     x;
 
     // Use this as a constructor:
-    friend Lit mkLit(Var var, bool sign = false);
+    friend Lit mkLit(Var var, bool sign);
 
     bool operator == (Lit p) const { return x == p.x; }
     bool operator != (Lit p) const { return x != p.x; }
