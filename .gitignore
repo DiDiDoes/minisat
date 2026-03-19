@@ -1,2 +1,6 @@
 config.mk
 build
+
+*.pyc
+minisat_wrapper.egg-info
+minisat_wrapper.cpython-311-x86_64-linux-gnu.so
