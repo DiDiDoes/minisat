@@ -93,6 +93,52 @@ def test_default_branching_literal_replays_minisat_choice():
     assert solver.decisions == 2
 
 
+def test_clause_learning_false_still_solves_conflict_formula():
+    solver = minisat_wrapper.MiniSAT(
+        [[-1, 2], [-1, -2], [1, 2]],
+        clause_learning=False,
+    )
+
+    assert solver.state == minisat_wrapper.STATE_UNRESOLVED
+    assert solver.candidates == [1, -1, 2, -2]
+
+    solver.step(1)
+
+    assert solver.state == minisat_wrapper.STATE_SAT
+    assert solver.candidates == []
+    assert solver.conflicts == 1
+    assert solver.decisions == 2
+
+
+def test_dpll_retries_complement_without_counting_decision():
+    solver = minisat_wrapper.MiniSAT(
+        [[-1, 2], [-1, -2], [1, 2]],
+        clause_learning=False,
+        dpll=True,
+    )
+
+    solver.step(1)
+
+    assert solver.state == minisat_wrapper.STATE_SAT
+    assert solver.candidates == []
+    assert solver.conflicts == 1
+    assert solver.decisions == 2
+
+
+def test_dpll_can_still_learn_clauses():
+    solver = minisat_wrapper.MiniSAT(
+        [[-1, 2], [-1, -2], [1, 2]],
+        dpll=True,
+    )
+
+    solver.step(1)
+
+    assert solver.state == minisat_wrapper.STATE_SAT
+    assert solver.candidates == []
+    assert solver.conflicts == 1
+    assert solver.decisions == 2
+
+
 def test_default_branching_matches_native_solver_on_sat_example():
     path = EXAMPLES_DIR / "v5c24_sat.cnf"
     native_status, native_stats = run_native_solver(path)

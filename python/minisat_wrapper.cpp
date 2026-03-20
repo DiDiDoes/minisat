@@ -21,7 +21,11 @@ constexpr int kStateUnsat = 20;
 
 class PyMiniSAT : private Minisat::Solver {
 public:
-    explicit PyMiniSAT(const std::vector<std::vector<int>>& cnf) {
+    explicit PyMiniSAT(
+        const std::vector<std::vector<int>>& cnf,
+        bool clause_learning = true,
+        bool dpll = false)
+        : clause_learning_(clause_learning), dpll_(dpll) {
         load_cnf(cnf);
         begin_search();
     }
@@ -63,16 +67,27 @@ public:
         if (!is_candidate(literal))
             throw std::invalid_argument("literal is not a valid branching candidate");
 
+        const Minisat::Lit choice = decode_existing_literal(literal);
         decisions++;
+        if (dpll_)
+            decision_frames_.push_back(DecisionFrame{choice, false});
         newDecisionLevel();
-        uncheckedEnqueue(decode_existing_literal(literal));
+        uncheckedEnqueue(choice);
         settle();
     }
 
 private:
+    struct DecisionFrame {
+        Minisat::Lit literal;
+        bool tried_complement;
+    };
+
     int state_ = kStateUnresolved;
     std::vector<int> candidates_;
     bool search_initialized_ = false;
+    bool clause_learning_ = true;
+    bool dpll_ = false;
+    std::vector<DecisionFrame> decision_frames_;
 
     static int encode_literal(Minisat::Lit literal) {
         const int variable = Minisat::var(literal) + 1;
@@ -190,10 +205,10 @@ private:
         clearInterrupt();
         model.clear();
         conflict.clear();
+        decision_frames_.clear();
 
         if (!okay()) {
-            state_ = kStateUnsat;
-            candidates_.clear();
+            set_unsat_state();
             return;
         }
 
@@ -235,6 +250,79 @@ private:
             model[variable] = value(variable);
     }
 
+    void set_unsat_state() {
+        ok = false;
+        decision_frames_.clear();
+        candidates_.clear();
+        state_ = kStateUnsat;
+    }
+
+    void apply_conflict_heuristics() {
+        varDecayActivity();
+        claDecayActivity();
+
+        if (--learntsize_adjust_cnt == 0) {
+            learntsize_adjust_confl *= learntsize_adjust_inc;
+            learntsize_adjust_cnt = static_cast<int>(learntsize_adjust_confl);
+            max_learnts *= learntsize_inc;
+        }
+    }
+
+    void handle_cdcl_conflict(Minisat::CRef confl) {
+        int backtrack_level = 0;
+        Minisat::vec<Minisat::Lit> learnt_clause;
+        analyze(confl, learnt_clause, backtrack_level);
+        cancelUntil(backtrack_level);
+
+        if (learnt_clause.size() == 1) {
+            uncheckedEnqueue(learnt_clause[0]);
+        } else if (clause_learning_) {
+            Minisat::CRef cr = ca.alloc(learnt_clause, true);
+            learnts.push(cr);
+            attachClause(cr);
+            claBumpActivity(ca[cr]);
+            uncheckedEnqueue(learnt_clause[0], cr);
+        } else {
+            // The clause is intentionally not stored, but the implied literal still advances search.
+            uncheckedEnqueue(learnt_clause[0]);
+        }
+
+        apply_conflict_heuristics();
+    }
+
+    void handle_dpll_conflict(Minisat::CRef confl) {
+        if (clause_learning_) {
+            int ignored_backtrack_level = 0;
+            Minisat::vec<Minisat::Lit> learnt_clause;
+            analyze(confl, learnt_clause, ignored_backtrack_level);
+
+            if (learnt_clause.size() > 1) {
+                Minisat::CRef cr = ca.alloc(learnt_clause, true);
+                learnts.push(cr);
+                attachClause(cr);
+                claBumpActivity(ca[cr]);
+            }
+
+            apply_conflict_heuristics();
+        }
+
+        while (!decision_frames_.empty()) {
+            DecisionFrame& frame = decision_frames_.back();
+            cancelUntil(decisionLevel() - 1);
+
+            if (!frame.tried_complement) {
+                frame.tried_complement = true;
+                newDecisionLevel();
+                uncheckedEnqueue(~frame.literal);
+                return;
+            }
+
+            decision_frames_.pop_back();
+        }
+
+        set_unsat_state();
+    }
+
     void settle() {
         if (!search_initialized_)
             throw std::runtime_error("internal error: search used before initialization");
@@ -244,47 +332,23 @@ private:
             if (confl != Minisat::CRef_Undef) {
                 conflicts++;
                 if (decisionLevel() == 0) {
-                    ok = false;
-                    candidates_.clear();
-                    state_ = kStateUnsat;
+                    set_unsat_state();
                     return;
                 }
 
-                int backtrack_level = 0;
-                Minisat::vec<Minisat::Lit> learnt_clause;
-                analyze(confl, learnt_clause, backtrack_level);
-                cancelUntil(backtrack_level);
-
-                if (learnt_clause.size() == 1) {
-                    uncheckedEnqueue(learnt_clause[0]);
-                } else {
-                    Minisat::CRef cr = ca.alloc(learnt_clause, true);
-                    learnts.push(cr);
-                    attachClause(cr);
-                    claBumpActivity(ca[cr]);
-                    uncheckedEnqueue(learnt_clause[0], cr);
-                }
-
-                varDecayActivity();
-                claDecayActivity();
-
-                if (--learntsize_adjust_cnt == 0) {
-                    learntsize_adjust_confl *= learntsize_adjust_inc;
-                    learntsize_adjust_cnt = static_cast<int>(learntsize_adjust_confl);
-                    max_learnts *= learntsize_inc;
-                }
-
+                if (dpll_)
+                    handle_dpll_conflict(confl);
+                else
+                    handle_cdcl_conflict(confl);
                 continue;
             }
 
             if (decisionLevel() == 0 && !simplify()) {
-                ok = false;
-                candidates_.clear();
-                state_ = kStateUnsat;
+                set_unsat_state();
                 return;
             }
 
-            if (learnts.size() - nAssigns() >= max_learnts)
+            if (clause_learning_ && learnts.size() - nAssigns() >= max_learnts)
                 reduceDB();
 
             refresh_candidates();
@@ -307,7 +371,11 @@ PYBIND11_MODULE(minisat_wrapper, m) {
     m.doc() = "Step-wise pybind11 wrapper around MiniSAT";
 
     py::class_<PyMiniSAT>(m, "MiniSAT")
-        .def(py::init<const std::vector<std::vector<int>>&>(), py::arg("cnf"))
+        .def(
+            py::init<const std::vector<std::vector<int>>&, bool, bool>(),
+            py::arg("cnf"),
+            py::arg("clause_learning") = true,
+            py::arg("dpll") = false)
         .def_property_readonly("state", &PyMiniSAT::state)
         .def_property_readonly("candidates", &PyMiniSAT::candidates)
         .def_property_readonly("conflicts", &PyMiniSAT::conflicts_count)

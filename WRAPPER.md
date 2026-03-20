@@ -7,7 +7,7 @@ Expose MiniSAT as a step-wise Python object that accepts a CNF formula directly 
 The wrapper presents the solver as:
 
 ```python
-solver = MiniSAT(cnf)
+solver = MiniSAT(cnf, clause_learning=True, dpll=False)
 ```
 
 where `cnf` is a `list[list[int]]`. Each inner list is a clause, and each integer is a DIMACS-style literal:
@@ -25,7 +25,7 @@ cnf = [
     [2, 3],
     [-1, -3],
 ]
-solver = MiniSAT(cnf)
+solver = MiniSAT(cnf, clause_learning=True, dpll=False)
 ```
 
 ## Public API
@@ -34,7 +34,12 @@ The Python wrapper exposes a single stateful class:
 
 ```python
 class MiniSAT:
-    def __init__(self, cnf: list[list[int]]) -> None: ...
+    def __init__(
+        self,
+        cnf: list[list[int]],
+        clause_learning: bool = True,
+        dpll: bool = False,
+    ) -> None: ...
 
     @property
     def state(self) -> int: ...
@@ -54,21 +59,62 @@ class MiniSAT:
     def step(self, literal: int) -> None: ...
 ```
 
+## Search Options
+
+The wrapper should expose two constructor-only search options:
+
+- `clause_learning`: defaults to `True`
+- `dpll`: defaults to `False`
+
+These options affect only the internal conflict-handling behavior after the CNF has been loaded. They do not change the CNF input format, the public state codes, or the meaning of `candidates`.
+
+### `clause_learning`
+
+`clause_learning` controls whether conflicts produce new learnt clauses in the internal MiniSAT database.
+
+- when `True`, the wrapper keeps the current behavior of deriving a conflict clause and adding it to `learnts`
+- when `False`, the wrapper must not allocate, attach, or enqueue via a newly learnt clause
+
+This option does not disable propagation, simplification, or the existing original clauses.
+
+### `dpll`
+
+`dpll` controls backtracking strategy after a conflict.
+
+- when `False`, the wrapper keeps its current CDCL-style backjumping behavior
+- when `True`, the wrapper must backtrack chronologically and try the complement of the most recent decision literal before returning control to Python
+
+With `dpll=True`, one call to `step(literal)` may internally consume both polarities of the same decision variable before the wrapper pauses again.
+
+### Interaction of the Options
+
+The two options should be independent:
+
+- `clause_learning=False, dpll=False`: no learning, but still use MiniSAT-style conflict analysis and backjumping
+- `clause_learning=True, dpll=False`: current wrapper behavior
+- `clause_learning=False, dpll=True`: closest to textbook DPLL
+- `clause_learning=True, dpll=True`: chronological backtracking with learnt-clause retention
+
+The last combination is intentionally not pure DPLL. It is still useful as an explicit mode because the requested behavior for `dpll` is about chronological undo and complement retry, not about forcing learning off.
+
 ## Construction
 
-`MiniSAT(cnf)` performs these actions:
+`MiniSAT(cnf, clause_learning=True, dpll=False)` performs these actions:
 
 1. Create an internal MiniSAT `Solver`.
 2. Scan the CNF and allocate enough solver variables to cover the largest absolute literal.
 3. Add every clause to the solver.
-4. Run unit propagation until the solver reaches a stable branching point or a terminal result.
-5. Initialize all public properties.
+4. Store the chosen values of `clause_learning` and `dpll` in the wrapper instance.
+5. Run unit propagation until the solver reaches a stable branching point or a terminal result.
+6. Initialize all public properties.
 
 Construction is therefore not a passive load step. When the object is returned:
 
 - `state == 20` if the formula is already inconsistent
 - `state == 10` if all variables are fixed without any further branching
 - `state == 0` if the solver is waiting for an external branching decision
+
+The two option values are fixed for the lifetime of the solver instance.
 
 ## State Model
 
@@ -141,6 +187,8 @@ These counters should be updated:
 - after construction
 - after every call to `step`
 
+When `dpll=True`, the wrapper's automatic complement retries should not increment `decisions`. To stay consistent with MiniSat, they should be treated like implied assignments performed during internal conflict recovery rather than as external branching decisions.
+
 ## `default_branching_literal()`
 
 `default_branching_literal()` returns the literal that MiniSAT itself would branch on next at the current pause point.
@@ -157,6 +205,8 @@ This method exists so a Python controller can exactly replay MiniSAT's own defau
 literal = solver.default_branching_literal()
 solver.step(literal)
 ```
+
+When `dpll=True`, this method still reports the next branching literal at a stable external pause point. It does not expose the internal complement retry that may happen during conflict recovery.
 
 ## `step(literal)`
 
@@ -176,12 +226,19 @@ The input `literal` must be one of the values currently present in `candidates`.
 2. Validate that `literal` is an allowed branching candidate.
 3. Push `literal` as the next decision on the MiniSAT trail.
 4. Resume the internal search loop.
-5. Continue through propagation, conflict analysis, learnt-clause insertion, and backtracking as needed.
+5. Continue through propagation and conflict handling as needed.
 6. Stop only when one of the following becomes true:
    - the solver proves SAT
    - the solver proves UNSAT
    - propagation is complete and a new external branching choice is required
 7. Refresh `state`, `candidates`, `conflicts`, `decisions`, and `propagations`.
+
+Conflict handling depends on the constructor options:
+
+- if `dpll == False`, use the current wrapper strategy
+- if `clause_learning == True`, conflicts may add learnt clauses
+- if `clause_learning == False`, conflicts must not add learnt clauses
+- if `dpll == True`, a conflict must not immediately return to Python after undoing one level; the wrapper must first try the complement of the most recent unresolved decision literal and continue propagation
 
 ### Postcondition
 
@@ -200,6 +257,8 @@ This keeps the Python API aligned with CDCL behavior:
 - the caller chooses decision literals
 - MiniSAT still owns propagation, learning, backjumping, and termination
 
+When `dpll=True`, the final bullet changes slightly: MiniSAT still owns propagation and termination, but the wrapper replaces MiniSAT's non-chronological backjumping with an explicit chronological branch-flip policy.
+
 ## Error Handling
 
 The wrapper should reject malformed CNF input during construction.
@@ -209,6 +268,7 @@ Recommended validation:
 - `cnf` must be a list of lists
 - every literal must be a non-zero integer
 - empty clauses are allowed and should immediately make the solver UNSAT
+- `clause_learning` and `dpll` should be accepted as booleans
 
 Recommended `step` errors:
 
@@ -222,8 +282,111 @@ The main design requirement is that the wrapper exposes a paused-search interfac
 - stop after propagation reaches a decision point
 - accept an externally supplied decision literal
 - resume the normal MiniSAT search procedure
+- optionally suppress learnt-clause insertion
+- optionally replace non-chronological backjumping with chronological branch flipping
 
 Conceptually, the adapter behaves like a restricted version of `search()` where branch selection is delegated to Python instead of always calling MiniSAT's internal `pickBranchLit()`.
+
+### Current Control Flow
+
+The current wrapper already differs from upstream MiniSAT in one important way: it does not use the outer restart loop from `solve_()`. Instead, `step()` pushes one external decision and `settle()` runs propagation and conflict handling until a new stable pause point is reached.
+
+This is the correct place to add `clause_learning` and `dpll`, because both requested options only affect the inner conflict path.
+
+### Planned Wrapper State
+
+To support the new options cleanly, the wrapper should add:
+
+- a stored `clause_learning_` boolean
+- a stored `dpll_` boolean
+- a wrapper-side decision stack that records each explicit branch literal and whether its complement has already been tried
+
+The decision stack is needed only because `dpll=True` cannot be implemented as a naive "always negate the current decision literal" rule. Without extra bookkeeping, the solver would oscillate forever between `x` and `not x` on repeated conflicts at the same level.
+
+A reasonable internal structure is:
+
+```cpp
+struct DecisionFrame {
+    Minisat::Lit literal;
+    bool tried_complement;
+};
+```
+
+and then:
+
+```cpp
+std::vector<DecisionFrame> decision_frames_;
+```
+
+### Planned `step()` Changes
+
+Before enqueuing the user-supplied decision, `step()` should push a new decision frame whose `literal` is the chosen branch and whose `tried_complement` flag is `false`.
+
+Decision counting should remain consistent with MiniSat:
+
+- increment `decisions` for the external branch chosen by Python
+- when `dpll=True`, do not increment `decisions` for the wrapper's automatic complement retry
+- the complement retry should instead be documented and implemented as an implied assignment during internal conflict recovery
+
+### Planned Conflict Path
+
+The implementation should split the current conflict block into two modes.
+
+#### Mode 1: `dpll == False`
+
+This remains structurally close to the current code:
+
+- run MiniSAT conflict analysis
+- if `clause_learning == True`, attach the learnt clause as today
+- if `clause_learning == False`, skip allocating and attaching the learnt clause
+- preserve the current non-chronological backtrack target computed by analysis
+
+In this mode, `clause_learning=False` changes only clause insertion. It does not change the backjump target or the fact that conflict analysis is still used to decide how far to backtrack.
+
+#### Mode 2: `dpll == True`
+
+This mode replaces MiniSAT's backjumping with wrapper-managed chronological recovery:
+
+1. On conflict, if `decisionLevel() == 0`, report UNSAT.
+2. Look at the most recent decision frame.
+3. If that frame has not yet tried its complement:
+   - save the original decision literal
+   - backtrack one decision level
+   - mark the frame as having tried its complement
+   - create a fresh decision level
+   - enqueue the complement literal
+   - continue propagation without returning to Python
+4. If that frame has already tried its complement:
+   - backtrack one decision level
+   - pop the exhausted frame
+   - continue the same process with the next older decision frame
+5. If no decision frames remain, report UNSAT.
+
+This behavior matches the requested policy "undo the last decision and try the complement of the last decision literal" without creating an infinite flip loop.
+
+### Interaction Between `dpll` and `clause_learning`
+
+When `dpll=True`, clause learning should still be controlled independently:
+
+- if `clause_learning=False`, the conflict path can skip `analyze(...)` entirely and just perform chronological recovery
+- if `clause_learning=True`, the wrapper may still call `analyze(...)` to derive a learnt clause, but it must ignore MiniSAT's computed backjump level and must not use the asserting-literal enqueue as the next branch choice
+
+In other words, under `dpll=True`, learnt clauses may be retained, but branch recovery is still governed by the wrapper's chronological policy.
+
+### Candidate Refresh Semantics
+
+`candidates` should remain an external branching frontier only. In particular:
+
+- when `dpll=False`, behavior stays unchanged
+- when `dpll=True`, the wrapper must not pause and expose `candidates` in between "conflict" and "retry the complement of the last decision"
+- `candidates` should only be recomputed after all mandatory internal propagation and any automatic DPLL branch flips have settled
+
+### Database Reduction
+
+`reduceDB()` should only matter when learnt clauses exist.
+
+- if `clause_learning=True`, keep the current learnt-database maintenance behavior
+- if `clause_learning=False`, `learnts` should remain empty, so reduction should become a no-op in practice
 
 The wrapper should keep MiniSAT as the source of truth for:
 
@@ -240,6 +403,8 @@ Python should only observe:
 - current terminal status
 - current legal branch choices
 - aggregate search counters
+
+The only internal state that Python does not observe directly but that the wrapper now needs to maintain is the decision-frame stack used for `dpll=True`.
 
 ## Binding Options
 
@@ -508,6 +673,8 @@ This wrapper defines a controlled CDCL interface:
 
 - Python provides the CNF directly as `list[list[int]]`
 - Python chooses each branching literal through `step(literal)`
-- MiniSAT performs all propagation and learning between branch points
+- MiniSAT performs all propagation between branch points, with optional learnt-clause insertion
 - `state`, `candidates`, and the solver statistics always describe the fully settled current search position
+- `clause_learning` controls whether conflicts add learnt clauses
+- `dpll` controls whether conflicts backjump normally or instead retry the complement of the latest decision in chronological order
 - `pybind11` is the most natural binding approach unless the project specifically wants a reusable C ABI
