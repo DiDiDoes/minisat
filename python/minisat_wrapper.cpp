@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -10,10 +11,23 @@
 #include <pybind11/stl.h>
 
 #include "minisat/core/Solver.h"
+#include "minisat/utils/System.h"
 
 namespace py = pybind11;
 
 namespace {
+
+void ensure_repeatable_fpu_precision() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+#if defined(__linux__) && defined(_FPU_EXTENDED) && defined(_FPU_DOUBLE) && defined(_FPU_GETCW)
+        fpu_control_t oldcw, newcw;
+        _FPU_GETCW(oldcw);
+        newcw = (oldcw & ~_FPU_EXTENDED) | _FPU_DOUBLE;
+        _FPU_SETCW(newcw);
+#endif
+    });
+}
 
 constexpr int kStateUnresolved = 0;
 constexpr int kStateSat = 10;
@@ -26,6 +40,7 @@ public:
         bool clause_learning = true,
         bool dpll = false)
         : clause_learning_(clause_learning), dpll_(dpll) {
+        ensure_repeatable_fpu_precision();
         load_cnf(cnf);
         begin_search();
     }
@@ -61,6 +76,21 @@ public:
         return py::int_(encode_literal(next));
     }
 
+    py::object pick_default_branch_literal() {
+        if (state_ != kStateUnresolved)
+            return py::none();
+
+        if (!has_reserved_default_choice_) {
+            reserved_default_choice_ = pick_default_branch_lit();
+            has_reserved_default_choice_ = reserved_default_choice_ != Minisat::lit_Undef;
+        }
+
+        if (!has_reserved_default_choice_)
+            return py::none();
+
+        return py::int_(encode_literal(reserved_default_choice_));
+    }
+
     py::list step(py::object literal = py::none()) {
         if (!initial_tokens_consumed_) {
             if (!literal.is_none())
@@ -77,11 +107,20 @@ public:
             throw std::invalid_argument("literal must be provided after the initial step() call");
 
         const int requested_literal = literal.cast<int>();
-        if (!is_candidate(requested_literal))
-            throw std::invalid_argument("literal is not a valid branching candidate");
 
         TokenBuffer tokens;
-        const Minisat::Lit choice = decode_existing_literal(requested_literal);
+        Minisat::Lit choice = Minisat::lit_Undef;
+        if (has_reserved_default_choice_) {
+            if (requested_literal != encode_literal(reserved_default_choice_))
+                throw std::invalid_argument("literal does not match the reserved default branching literal");
+            choice = reserved_default_choice_;
+            reserved_default_choice_ = Minisat::lit_Undef;
+            has_reserved_default_choice_ = false;
+        } else {
+            if (!is_candidate(requested_literal))
+                throw std::invalid_argument("literal is not a valid branching candidate");
+            choice = decode_existing_literal(requested_literal);
+        }
         decisions++;
         if (dpll_)
             decision_frames_.push_back(DecisionFrame{choice, false});
@@ -106,6 +145,8 @@ private:
     bool search_initialized_ = false;
     bool clause_learning_ = true;
     bool dpll_ = false;
+    bool has_reserved_default_choice_ = false;
+    Minisat::Lit reserved_default_choice_ = Minisat::lit_Undef;
     std::vector<DecisionFrame> decision_frames_;
     std::vector<bool> trail_is_external_decision_;
     TokenBuffer pending_initial_tokens_;
@@ -174,6 +215,32 @@ private:
         if (!heap.empty())
             percolate_down_snapshot(heap, 0);
         return minimum;
+    }
+
+    Minisat::Lit pick_default_branch_lit() {
+        Minisat::Var next = Minisat::var_Undef;
+
+        if (Minisat::Solver::drand(random_seed) < random_var_freq && !order_heap.empty()) {
+            next = order_heap[Minisat::Solver::irand(random_seed, order_heap.size())];
+            if (value(next) == Minisat::l_Undef && decision[next])
+                rnd_decisions++;
+        }
+
+        while (next == Minisat::var_Undef || value(next) != Minisat::l_Undef || !decision[next]) {
+            if (order_heap.empty()) {
+                next = Minisat::var_Undef;
+                break;
+            }
+            next = order_heap.removeMin();
+        }
+
+        if (next == Minisat::var_Undef)
+            return Minisat::lit_Undef;
+        if (user_pol[next] != Minisat::l_Undef)
+            return Minisat::mkLit(next, user_pol[next] == Minisat::l_True);
+        if (rnd_pol)
+            return Minisat::mkLit(next, Minisat::Solver::drand(random_seed) < 0.5);
+        return Minisat::mkLit(next, polarity[next]);
     }
 
     Minisat::Lit peek_default_branch_lit() const {
@@ -247,6 +314,8 @@ private:
         model.clear();
         conflict.clear();
         decision_frames_.clear();
+        has_reserved_default_choice_ = false;
+        reserved_default_choice_ = Minisat::lit_Undef;
         trail_is_external_decision_.assign(static_cast<std::size_t>(trail.size()), false);
         pending_initial_tokens_.clear();
         initial_tokens_consumed_ = false;
@@ -298,6 +367,8 @@ private:
     void set_unsat_state() {
         ok = false;
         decision_frames_.clear();
+        has_reserved_default_choice_ = false;
+        reserved_default_choice_ = Minisat::lit_Undef;
         candidates_.clear();
         trail_is_external_decision_.resize(static_cast<std::size_t>(trail.size()));
         state_ = kStateUnsat;
@@ -470,6 +541,7 @@ PYBIND11_MODULE(minisat_wrapper, m) {
         .def_property_readonly("decisions", &PyMiniSAT::decisions_count)
         .def_property_readonly("propagations", &PyMiniSAT::propagations_count)
         .def("default_branching_literal", &PyMiniSAT::default_branching_literal)
+        .def("pick_default_branch_literal", &PyMiniSAT::pick_default_branch_literal)
         .def("step", &PyMiniSAT::step, py::arg("literal") = py::none());
 
     m.attr("STATE_UNRESOLVED") = py::int_(kStateUnresolved);

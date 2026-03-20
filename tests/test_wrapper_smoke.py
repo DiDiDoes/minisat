@@ -45,11 +45,17 @@ def run_native_solver(path: Path):
     return proc.returncode, stats
 
 
+def get_default_branch_literal(solver):
+    if hasattr(solver, "pick_default_branch_literal"):
+        return solver.pick_default_branch_literal()
+    return solver.default_branching_literal()
+
+
 def run_wrapper_with_default_branching(path: Path):
     solver = minisat_wrapper.MiniSAT(parse_dimacs(path))
     solver.step()
     while solver.state == minisat_wrapper.STATE_UNRESOLVED:
-        literal = solver.default_branching_literal()
+        literal = get_default_branch_literal(solver)
         assert literal in solver.candidates
         solver.step(literal)
     return solver.state, {
@@ -90,7 +96,7 @@ solver = minisat_wrapper.MiniSAT(
 )
 solver.step()
 while solver.state == minisat_wrapper.STATE_UNRESOLVED:
-    literal = solver.default_branching_literal()
+    literal = solver.pick_default_branch_literal() if hasattr(solver, 'pick_default_branch_literal') else solver.default_branching_literal()
     if literal not in solver.candidates:
         raise RuntimeError(f'invalid literal {literal} for candidates {solver.candidates}')
     solver.step(literal)
