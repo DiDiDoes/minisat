@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 
 import minisat_wrapper
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = REPO_ROOT / "examples"
@@ -44,6 +45,7 @@ def run_native_solver(path: Path):
 
 def run_wrapper_with_default_branching(path: Path):
     solver = minisat_wrapper.MiniSAT(parse_dimacs(path))
+    solver.step()
     while solver.state == minisat_wrapper.STATE_UNRESOLVED:
         literal = solver.default_branching_literal()
         assert literal in solver.candidates
@@ -55,23 +57,35 @@ def run_wrapper_with_default_branching(path: Path):
     }
 
 
+def test_first_call_must_consume_initial_trace():
+    solver = minisat_wrapper.MiniSAT([[1, 2]])
+
+    with pytest.raises(ValueError):
+        solver.step(1)
+
+
 def test_unsat_construction():
     solver = minisat_wrapper.MiniSAT([[1], [-1]])
     assert solver.state == minisat_wrapper.STATE_UNSAT
     assert solver.candidates == []
     assert solver.default_branching_literal() is None
+    assert solver.step() == ["UNSAT"]
+
+    with pytest.raises(RuntimeError):
+        solver.step()
 
 
 def test_sat_via_two_steps():
     solver = minisat_wrapper.MiniSAT([[1, 2]])
+    assert solver.step() == ["D"]
     assert solver.state == minisat_wrapper.STATE_UNRESOLVED
     assert solver.candidates == [1, -1, 2, -2]
 
-    solver.step(1)
+    assert solver.step(1) == [1, "D"]
     assert solver.state == minisat_wrapper.STATE_UNRESOLVED
     assert solver.candidates == [2, -2]
 
-    solver.step(2)
+    assert solver.step(2) == [2, "SAT"]
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
     assert solver.default_branching_literal() is None
@@ -81,12 +95,13 @@ def test_sat_via_two_steps():
 
 def test_default_branching_literal_replays_minisat_choice():
     solver = minisat_wrapper.MiniSAT([[1, 2]])
+    assert solver.step() == ["D"]
     literal = solver.default_branching_literal()
 
     assert literal == -1
     assert literal in solver.candidates
 
-    solver.step(literal)
+    assert solver.step(literal) == [-1, 2, "SAT"]
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
     assert solver.default_branching_literal() is None
@@ -99,11 +114,11 @@ def test_clause_learning_false_still_solves_conflict_formula():
         clause_learning=False,
     )
 
+    assert solver.step() == ["D"]
     assert solver.state == minisat_wrapper.STATE_UNRESOLVED
     assert solver.candidates == [1, -1, 2, -2]
 
-    solver.step(1)
-
+    assert solver.step(1) == [1, 2, -1, 2, "SAT"]
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
     assert solver.conflicts == 1
@@ -117,8 +132,8 @@ def test_dpll_retries_complement_without_counting_decision():
         dpll=True,
     )
 
-    solver.step(1)
-
+    assert solver.step() == ["D"]
+    assert solver.step(1) == [1, 2, "[BT]", -1, 2, "SAT"]
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
     assert solver.conflicts == 1
@@ -131,8 +146,8 @@ def test_dpll_can_still_learn_clauses():
         dpll=True,
     )
 
-    solver.step(1)
-
+    assert solver.step() == ["D"]
+    assert solver.step(1) == [1, 2, "[BT]", -1, 2, "SAT"]
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
     assert solver.conflicts == 1

@@ -2,7 +2,7 @@
 
 ## Goal
 
-Expose MiniSAT as a step-wise Python object that accepts a CNF formula directly from Python data structures and allows an external controller to drive branching decisions one step at a time.
+Expose MiniSAT as a step-wise Python object that accepts a CNF formula directly from Python data structures, allows an external controller to drive branching decisions one step at a time, and can emit the same trajectory-token stream that `src.dpll.DPLL.step()` returns.
 
 The wrapper presents the solver as:
 
@@ -56,7 +56,7 @@ class MiniSAT:
     @property
     def propagations(self) -> int: ...
 
-    def step(self, literal: int) -> None: ...
+    def step(self, literal: int | None = None) -> list[int | str]: ...
 ```
 
 ## Search Options
@@ -678,3 +678,124 @@ This wrapper defines a controlled CDCL interface:
 - `clause_learning` controls whether conflicts add learnt clauses
 - `dpll` controls whether conflicts backjump normally or instead retry the complement of the latest decision in chronological order
 - `pybind11` is the most natural binding approach unless the project specifically wants a reusable C ABI
+
+## Trajectory Token Emission Investigation
+
+The current wrapper implementation in `minisat/python/minisat_wrapper.cpp` already matches the pure DPLL solver on the important search-state pieces in `clause_learning=False, dpll=True` mode:
+
+- both solvers expose the same `state`, `candidates`, `conflicts`, `decisions`, and `propagations`
+- both solvers consume one external branch literal per `step(literal)` call
+- both solvers perform internal chronological complement retries without incrementing `decisions`
+
+What the wrapper does **not** expose yet is the trajectory itself. `src.dpll.DPLL.step()` returns a token list, while the MiniSAT wrapper currently returns `None` and only mutates internal state.
+
+### DPLL Token Contract To Match
+
+The observable contract in `src/dpll.py` is:
+
+- explicit branch literals are emitted as signed integers
+- each newly implied literal discovered by propagation is emitted as a signed integer
+- `"D"` is emitted only when the solver pauses for the next external branch choice
+- `"[BT]"` is emitted when `dpll=True` backtracks and immediately retries an internal complement
+- after `"[BT]"`, the solver replays its surviving assignment trail, prefixing only true external decisions with `"D"`
+- terminal calls emit `"SAT"` or `"UNSAT"`
+
+There is one important API wrinkle: DPLL also uses `step(None)` for the initial root-level propagation trace. The MiniSAT wrapper currently performs that propagation inside construction, so matching DPLL exactly requires a buffered initial token trace that can be returned on the first `step(None)` call.
+
+### Recommended Public API Change
+
+To make token emission part of the contract, the wrapper API should change to:
+
+```python
+class MiniSAT:
+    def step(self, literal: int | None = None) -> list[int | str]: ...
+```
+
+Behavior:
+
+- the first `step(None)` returns the constructor-time propagation tokens and then one of `"D"`, `"SAT"`, or `"UNSAT"`
+- later `step(literal)` calls return the chosen branch literal, all implied literals discovered before the next pause, and the final control token for that pause point
+- calling `step(None)` after the initial buffered trace has been consumed should raise `ValueError`
+- calling `step(...)` after termination should still raise `RuntimeError`
+
+A pybind11-friendly signature is:
+
+```cpp
+py::list step(py::object literal = py::none());
+```
+
+### Where To Hook Token Emission In MiniSAT
+
+The existing wrapper control flow already has the right top-level boundaries:
+
+- constructor: `begin_search()`
+- external branch step: `step(int literal)`
+- inner search loop: `settle()`
+- conflict recovery: `handle_cdcl_conflict(...)` and `handle_dpll_conflict(...)`
+
+The least invasive design is to thread a per-call token buffer through those wrapper-managed methods instead of rewriting MiniSAT's internal `propagate()` loop.
+
+Recommended changes:
+
+- change `begin_search()` so it records constructor-time tokens into `pending_initial_tokens_`
+- change `step(...)` so it creates a fresh token buffer for each external call and returns it
+- change `settle(...)` to append new implied literals after each call to `propagate()`
+- change `handle_dpll_conflict(...)` to append `"[BT]"` plus a replayed trail snapshot whenever it flips the latest unresolved decision
+- optionally change `handle_cdcl_conflict(...)` to emit MiniSAT-specific extensions such as learnt clauses via the existing reserved `"L"` token
+
+### Extra State The Wrapper Needs
+
+MiniSAT's native trail is not enough to reconstruct the DPLL token stream exactly.
+
+The current wrapper already stores a `decision_frames_` stack, which is enough for chronological branch flipping. Exact DPLL-style token replay needs two more pieces of wrapper-side state:
+
+```cpp
+std::vector<py::object> pending_initial_tokens_;
+std::vector<bool> trail_is_external_decision_;
+bool initial_tokens_consumed_ = false;
+```
+
+Why `trail_is_external_decision_` is necessary:
+
+- `trail_lim` tells us where decision levels start, but not whether the first literal at that level came from Python or from an automatic complement retry
+- MiniSAT records both external decisions and internal retries with `uncheckedEnqueue(...)`
+- the DPLL token format prefixes only external decisions with `"D"` during a backtrack replay
+
+Without that metadata, the wrapper cannot faithfully reproduce the `"[BT]", ..., "D", lit, ...` snapshot format from `src.dpll.DPLL`.
+
+### Minimal Helper Functions
+
+A clean implementation can stay entirely in the wrapper by adding helpers like:
+
+```cpp
+void emit_new_propagations(py::list& tokens, int old_trail_size);
+void emit_backtrack_snapshot(py::list& tokens) const;
+void cancel_until_with_metadata(int level);
+```
+
+Expected responsibilities:
+
+- `emit_new_propagations(...)` scans `trail[old_trail_size:]` after each `propagate()` call, appends the new implied literals in order, and extends `trail_is_external_decision_` with `false` for those new assignments
+- `emit_backtrack_snapshot(...)` appends `"[BT]"` and then replays the current live trail, inserting `"D"` only where `trail_is_external_decision_[i]` is `true`
+- `cancel_until_with_metadata(...)` calls MiniSAT's `cancelUntil(level)` and then shrinks `trail_is_external_decision_` to the new `trail.size()`
+
+This keeps the implementation aligned with the current wrapper architecture in [`minisat/python/minisat_wrapper.cpp`](/home/chengdicao/repos/SATLM/minisat/python/minisat_wrapper.cpp:64) and [`minisat/python/minisat_wrapper.cpp`](/home/chengdicao/repos/SATLM/minisat/python/minisat_wrapper.cpp:326).
+
+### Scope Of Exact Compatibility
+
+Exact token parity should be specified against `clause_learning=False, dpll=True` first.
+
+That is the only mode where the current MiniSAT wrapper is intentionally matching the pure DPLL solver's search behavior. In the other modes:
+
+- `dpll=False` preserves MiniSAT's non-chronological backjumping, so the stream can only be DPLL-like, not identical
+- `clause_learning=True` may reasonably extend the stream with MiniSAT-specific learnt-clause tokens, for example `['L', lit1, lit2, ..., 0]`
+
+Those modes can still share the same base vocabulary for literals, `"D"`, `"[BT]"`, `"SAT"`, and `"UNSAT"`, but they should be documented as supersets rather than exact replicas of `src.dpll.DPLL`.
+
+### Practical Outcome
+
+The main implementation takeaway is straightforward:
+
+- the existing wrapper search logic is already close enough for token emission
+- the required work is primarily API and bookkeeping, not a rewrite of MiniSAT's solver core
+- the critical missing pieces are a returned token buffer, a buffered initial trace for `step(None)`, and wrapper-side trail metadata for backtrack replay

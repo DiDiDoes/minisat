@@ -61,22 +61,41 @@ public:
         return py::int_(encode_literal(next));
     }
 
-    void step(int literal) {
+    py::list step(py::object literal = py::none()) {
+        if (!initial_tokens_consumed_) {
+            if (!literal.is_none())
+                throw std::invalid_argument("the first step() call must be step(None) to consume the initial token trace");
+            initial_tokens_consumed_ = true;
+            py::list tokens = tokens_to_list(pending_initial_tokens_);
+            pending_initial_tokens_.clear();
+            return tokens;
+        }
+
         if (state_ != kStateUnresolved)
             throw std::runtime_error("step() is only valid while the solver is unresolved");
-        if (!is_candidate(literal))
+        if (literal.is_none())
+            throw std::invalid_argument("literal must be provided after the initial step() call");
+
+        const int requested_literal = literal.cast<int>();
+        if (!is_candidate(requested_literal))
             throw std::invalid_argument("literal is not a valid branching candidate");
 
-        const Minisat::Lit choice = decode_existing_literal(literal);
+        TokenBuffer tokens;
+        const Minisat::Lit choice = decode_existing_literal(requested_literal);
         decisions++;
         if (dpll_)
             decision_frames_.push_back(DecisionFrame{choice, false});
+        emit_token(tokens, requested_literal);
         newDecisionLevel();
         uncheckedEnqueue(choice);
-        settle();
+        trail_is_external_decision_.push_back(true);
+        settle(tokens);
+        return tokens_to_list(tokens);
     }
 
 private:
+    using TokenBuffer = std::vector<py::object>;
+
     struct DecisionFrame {
         Minisat::Lit literal;
         bool tried_complement;
@@ -88,6 +107,9 @@ private:
     bool clause_learning_ = true;
     bool dpll_ = false;
     std::vector<DecisionFrame> decision_frames_;
+    std::vector<bool> trail_is_external_decision_;
+    TokenBuffer pending_initial_tokens_;
+    bool initial_tokens_consumed_ = false;
 
     static int encode_literal(Minisat::Lit literal) {
         const int variable = Minisat::var(literal) + 1;
@@ -97,6 +119,25 @@ private:
     static Minisat::Lit make_literal_unchecked(int literal) {
         const int variable = std::abs(literal) - 1;
         return Minisat::mkLit(variable, literal < 0);
+    }
+
+    static void emit_token(TokenBuffer& tokens, int literal) {
+        tokens.push_back(py::int_(literal));
+    }
+
+    static void emit_token(TokenBuffer& tokens, Minisat::Lit literal) {
+        emit_token(tokens, encode_literal(literal));
+    }
+
+    static void emit_token(TokenBuffer& tokens, const char* token) {
+        tokens.push_back(py::str(token));
+    }
+
+    static py::list tokens_to_list(const TokenBuffer& tokens) {
+        py::list result;
+        for (const py::object& token : tokens)
+            result.append(token);
+        return result;
     }
 
     bool activity_lt(Minisat::Var left, Minisat::Var right) const {
@@ -206,9 +247,14 @@ private:
         model.clear();
         conflict.clear();
         decision_frames_.clear();
+        trail_is_external_decision_.assign(static_cast<std::size_t>(trail.size()), false);
+        pending_initial_tokens_.clear();
+        initial_tokens_consumed_ = false;
+        search_initialized_ = true;
 
         if (!okay()) {
             set_unsat_state();
+            emit_token(pending_initial_tokens_, "UNSAT");
             return;
         }
 
@@ -219,9 +265,8 @@ private:
 
         learntsize_adjust_confl = learntsize_adjust_start_confl;
         learntsize_adjust_cnt = static_cast<int>(learntsize_adjust_confl);
-        search_initialized_ = true;
 
-        settle();
+        settle(pending_initial_tokens_);
     }
 
     bool is_candidate(int literal) const {
@@ -254,7 +299,29 @@ private:
         ok = false;
         decision_frames_.clear();
         candidates_.clear();
+        trail_is_external_decision_.resize(static_cast<std::size_t>(trail.size()));
         state_ = kStateUnsat;
+    }
+
+    void cancel_until_with_metadata(int level) {
+        cancelUntil(level);
+        trail_is_external_decision_.resize(static_cast<std::size_t>(trail.size()));
+    }
+
+    void emit_new_propagations(TokenBuffer& tokens, int old_trail_size) {
+        for (int index = old_trail_size; index < trail.size(); ++index) {
+            trail_is_external_decision_.push_back(false);
+            emit_token(tokens, trail[index]);
+        }
+    }
+
+    void emit_backtrack_snapshot(TokenBuffer& tokens) const {
+        emit_token(tokens, "[BT]");
+        for (int index = 0; index < trail.size(); ++index) {
+            if (trail_is_external_decision_[static_cast<std::size_t>(index)])
+                emit_token(tokens, "D");
+            emit_token(tokens, trail[index]);
+        }
     }
 
     void apply_conflict_heuristics() {
@@ -268,29 +335,34 @@ private:
         }
     }
 
-    void handle_cdcl_conflict(Minisat::CRef confl) {
+    void handle_cdcl_conflict(Minisat::CRef confl, TokenBuffer& tokens) {
         int backtrack_level = 0;
         Minisat::vec<Minisat::Lit> learnt_clause;
         analyze(confl, learnt_clause, backtrack_level);
-        cancelUntil(backtrack_level);
+        cancel_until_with_metadata(backtrack_level);
 
         if (learnt_clause.size() == 1) {
             uncheckedEnqueue(learnt_clause[0]);
+            trail_is_external_decision_.push_back(false);
+            emit_token(tokens, learnt_clause[0]);
         } else if (clause_learning_) {
             Minisat::CRef cr = ca.alloc(learnt_clause, true);
             learnts.push(cr);
             attachClause(cr);
             claBumpActivity(ca[cr]);
             uncheckedEnqueue(learnt_clause[0], cr);
+            trail_is_external_decision_.push_back(false);
+            emit_token(tokens, learnt_clause[0]);
         } else {
-            // The clause is intentionally not stored, but the implied literal still advances search.
             uncheckedEnqueue(learnt_clause[0]);
+            trail_is_external_decision_.push_back(false);
+            emit_token(tokens, learnt_clause[0]);
         }
 
         apply_conflict_heuristics();
     }
 
-    void handle_dpll_conflict(Minisat::CRef confl) {
+    void handle_dpll_conflict(Minisat::CRef confl, TokenBuffer& tokens) {
         if (clause_learning_) {
             int ignored_backtrack_level = 0;
             Minisat::vec<Minisat::Lit> learnt_clause;
@@ -308,12 +380,14 @@ private:
 
         while (!decision_frames_.empty()) {
             DecisionFrame& frame = decision_frames_.back();
-            cancelUntil(decisionLevel() - 1);
+            cancel_until_with_metadata(decisionLevel() - 1);
 
             if (!frame.tried_complement) {
                 frame.tried_complement = true;
                 newDecisionLevel();
                 uncheckedEnqueue(~frame.literal);
+                trail_is_external_decision_.push_back(false);
+                emit_backtrack_snapshot(tokens);
                 return;
             }
 
@@ -321,30 +395,38 @@ private:
         }
 
         set_unsat_state();
+        emit_token(tokens, "UNSAT");
     }
 
-    void settle() {
+    void settle(TokenBuffer& tokens) {
         if (!search_initialized_)
             throw std::runtime_error("internal error: search used before initialization");
 
         for (;;) {
+            const int old_trail_size = trail.size();
             Minisat::CRef confl = propagate();
+            emit_new_propagations(tokens, old_trail_size);
             if (confl != Minisat::CRef_Undef) {
                 conflicts++;
                 if (decisionLevel() == 0) {
                     set_unsat_state();
+                    emit_token(tokens, "UNSAT");
                     return;
                 }
 
                 if (dpll_)
-                    handle_dpll_conflict(confl);
+                    handle_dpll_conflict(confl, tokens);
                 else
-                    handle_cdcl_conflict(confl);
+                    handle_cdcl_conflict(confl, tokens);
+
+                if (state_ == kStateUnsat)
+                    return;
                 continue;
             }
 
             if (decisionLevel() == 0 && !simplify()) {
                 set_unsat_state();
+                emit_token(tokens, "UNSAT");
                 return;
             }
 
@@ -356,10 +438,12 @@ private:
                 decisions++;
                 store_model();
                 state_ = kStateSat;
+                emit_token(tokens, "SAT");
                 return;
             }
 
             state_ = kStateUnresolved;
+            emit_token(tokens, "D");
             return;
         }
     }
@@ -382,7 +466,7 @@ PYBIND11_MODULE(minisat_wrapper, m) {
         .def_property_readonly("decisions", &PyMiniSAT::decisions_count)
         .def_property_readonly("propagations", &PyMiniSAT::propagations_count)
         .def("default_branching_literal", &PyMiniSAT::default_branching_literal)
-        .def("step", &PyMiniSAT::step, py::arg("literal"));
+        .def("step", &PyMiniSAT::step, py::arg("literal") = py::none());
 
     m.attr("STATE_UNRESOLVED") = py::int_(kStateUnresolved);
     m.attr("STATE_SAT") = py::int_(kStateSat);
