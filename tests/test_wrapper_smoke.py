@@ -1,5 +1,7 @@
+import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import minisat_wrapper
@@ -55,6 +57,71 @@ def run_wrapper_with_default_branching(path: Path):
         "decisions": solver.decisions,
         "propagations": solver.propagations,
     }
+
+
+def run_wrapper_with_default_branching_subprocess(
+    path: Path,
+    *,
+    clause_learning: bool = True,
+    dpll: bool = False,
+):
+    script = """import json
+import sys
+from pathlib import Path
+
+import minisat_wrapper
+
+path = Path(sys.argv[1])
+clause_learning = sys.argv[2] == '1'
+dpll = sys.argv[3] == '1'
+cnf = []
+with path.open() as fh:
+    for line in fh:
+        line = line.strip()
+        if not line or line[0] in {'c', 'p'}:
+            continue
+        literals = [int(token) for token in line.split()]
+        cnf.append([literal for literal in literals if literal != 0])
+
+solver = minisat_wrapper.MiniSAT(
+    cnf,
+    clause_learning=clause_learning,
+    dpll=dpll,
+)
+solver.step()
+while solver.state == minisat_wrapper.STATE_UNRESOLVED:
+    literal = solver.default_branching_literal()
+    if literal not in solver.candidates:
+        raise RuntimeError(f'invalid literal {literal} for candidates {solver.candidates}')
+    solver.step(literal)
+
+print(json.dumps({
+    'state': solver.state,
+    'stats': {
+        'conflicts': solver.conflicts,
+        'decisions': solver.decisions,
+        'propagations': solver.propagations,
+    },
+}))
+"""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(path),
+            "1" if clause_learning else "0",
+            "1" if dpll else "0",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    payload = None
+    if proc.returncode == 0:
+        payload = json.loads(proc.stdout)
+    return proc, payload
 
 
 def test_first_call_must_consume_initial_trace():
@@ -173,3 +240,32 @@ def test_default_branching_matches_native_solver_on_unsat_example():
     assert native_status == 20
     assert wrapper_state == minisat_wrapper.STATE_UNSAT
     assert wrapper_stats == native_stats
+
+
+@pytest.mark.parametrize(
+    ("filename", "native_status", "wrapper_state"),
+    [
+        ("v5c24_sat.cnf", 10, minisat_wrapper.STATE_SAT),
+        ("v5c24_unsat.cnf", 20, minisat_wrapper.STATE_UNSAT),
+    ],
+)
+def test_clause_learning_false_matches_native_solver_on_examples(
+    filename: str,
+    native_status: int,
+    wrapper_state: int,
+):
+    path = EXAMPLES_DIR / filename
+    expected_native_status, native_stats = run_native_solver(path)
+    proc, payload = run_wrapper_with_default_branching_subprocess(
+        path,
+        clause_learning=False,
+    )
+
+    assert proc.returncode == 0, (
+        f"wrapper subprocess failed for {filename} with return code {proc.returncode}\n"
+        f"stdout:\n{proc.stdout}\n"
+        f"stderr:\n{proc.stderr}"
+    )
+    assert expected_native_status == native_status
+    assert payload["state"] == wrapper_state
+    assert payload["stats"] == native_stats

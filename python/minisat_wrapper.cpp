@@ -354,7 +354,11 @@ private:
             trail_is_external_decision_.push_back(false);
             emit_token(tokens, learnt_clause[0]);
         } else {
-            uncheckedEnqueue(learnt_clause[0]);
+            // Preserve the analyzed clause as an ephemeral reason for the
+            // asserting literal. Without a valid reason, later conflict
+            // analysis can dereference stale state on deeper examples.
+            Minisat::CRef cr = ca.alloc(learnt_clause, true);
+            uncheckedEnqueue(learnt_clause[0], cr);
             trail_is_external_decision_.push_back(false);
             emit_token(tokens, learnt_clause[0]);
         }
