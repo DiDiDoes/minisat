@@ -191,7 +191,22 @@ def test_clause_learning_false_still_solves_conflict_formula():
     assert solver.state == minisat_wrapper.STATE_UNRESOLVED
     assert solver.candidates == [1, -1, 2, -2]
 
-    assert solver.step(1) == [1, 2, -1, 2, "SAT"]
+    assert solver.step(1) == [1, 2, "[BT]", -1, 2, "SAT"]
+    assert solver.state == minisat_wrapper.STATE_SAT
+    assert solver.candidates == []
+    assert solver.conflicts == 1
+    assert solver.decisions == 2
+
+
+def test_cdcl_with_learning_emits_backtrack_snapshot():
+    solver = minisat_wrapper.MiniSAT(
+        [[-1, 2], [-1, -2], [1, 2]],
+        clause_learning=True,
+        dpll=False,
+    )
+
+    assert solver.step() == ["D"]
+    assert solver.step(1) == [1, 2, "[BT]", "L", -1, "0", -1, 2, "SAT"]
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
     assert solver.conflicts == 1
@@ -220,7 +235,7 @@ def test_dpll_can_still_learn_clauses():
     )
 
     assert solver.step() == ["D"]
-    assert solver.step(1) == [1, 2, "[BT]", -1, 2, "SAT"]
+    assert solver.step(1) == [1, 2, "[BT]", "L", -1, "0", -1, 2, "SAT"]
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
     assert solver.conflicts == 1

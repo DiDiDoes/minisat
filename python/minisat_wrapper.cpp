@@ -386,13 +386,26 @@ private:
         }
     }
 
+    void emit_learnt_clause(TokenBuffer& tokens, const Minisat::vec<Minisat::Lit>& learnt_clause) const {
+        emit_token(tokens, "L");
+        for (int index = 0; index < learnt_clause.size(); ++index)
+            emit_token(tokens, learnt_clause[index]);
+        emit_token(tokens, "0");
+    }
+
     void emit_backtrack_snapshot(TokenBuffer& tokens) const {
-        emit_token(tokens, "[BT]");
         for (int index = 0; index < trail.size(); ++index) {
             if (trail_is_external_decision_[static_cast<std::size_t>(index)])
                 emit_token(tokens, "D");
             emit_token(tokens, trail[index]);
         }
+    }
+
+    void emit_backtrack_event(TokenBuffer& tokens, const Minisat::vec<Minisat::Lit>* learnt_clause = nullptr) const {
+        emit_token(tokens, "[BT]");
+        if (learnt_clause != nullptr)
+            emit_learnt_clause(tokens, *learnt_clause);
+        emit_backtrack_snapshot(tokens);
     }
 
     void apply_conflict_heuristics() {
@@ -415,7 +428,6 @@ private:
         if (learnt_clause.size() == 1) {
             uncheckedEnqueue(learnt_clause[0]);
             trail_is_external_decision_.push_back(false);
-            emit_token(tokens, learnt_clause[0]);
         } else if (clause_learning_) {
             Minisat::CRef cr = ca.alloc(learnt_clause, true);
             learnts.push(cr);
@@ -423,7 +435,6 @@ private:
             claBumpActivity(ca[cr]);
             uncheckedEnqueue(learnt_clause[0], cr);
             trail_is_external_decision_.push_back(false);
-            emit_token(tokens, learnt_clause[0]);
         } else {
             // Preserve the analyzed clause as an ephemeral reason for the
             // asserting literal. Without a valid reason, later conflict
@@ -431,16 +442,20 @@ private:
             Minisat::CRef cr = ca.alloc(learnt_clause, true);
             uncheckedEnqueue(learnt_clause[0], cr);
             trail_is_external_decision_.push_back(false);
-            emit_token(tokens, learnt_clause[0]);
         }
+
+        if (clause_learning_)
+            emit_backtrack_event(tokens, &learnt_clause);
+        else
+            emit_backtrack_event(tokens);
 
         apply_conflict_heuristics();
     }
 
     void handle_dpll_conflict(Minisat::CRef confl, TokenBuffer& tokens) {
+        Minisat::vec<Minisat::Lit> learnt_clause;
         if (clause_learning_) {
             int ignored_backtrack_level = 0;
-            Minisat::vec<Minisat::Lit> learnt_clause;
             analyze(confl, learnt_clause, ignored_backtrack_level);
 
             if (learnt_clause.size() > 1) {
@@ -462,7 +477,10 @@ private:
                 newDecisionLevel();
                 uncheckedEnqueue(~frame.literal);
                 trail_is_external_decision_.push_back(false);
-                emit_backtrack_snapshot(tokens);
+                if (clause_learning_)
+                    emit_backtrack_event(tokens, &learnt_clause);
+                else
+                    emit_backtrack_event(tokens);
                 return;
             }
 

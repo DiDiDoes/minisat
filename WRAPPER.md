@@ -689,18 +689,64 @@ The current wrapper implementation in `minisat/python/minisat_wrapper.cpp` alrea
 
 What the wrapper does **not** expose yet is the trajectory itself. `src.dpll.DPLL.step()` returns a token list, while the MiniSAT wrapper currently returns `None` and only mutates internal state.
 
-### DPLL Token Contract To Match
+### Backtrack Token Contract
 
-The observable contract in `src/dpll.py` is:
+The observable contract in `src/dpll.py` is still the baseline vocabulary for the wrapper:
 
 - explicit branch literals are emitted as signed integers
 - each newly implied literal discovered by propagation is emitted as a signed integer
 - `"D"` is emitted only when the solver pauses for the next external branch choice
-- `"[BT]"` is emitted when `dpll=True` backtracks and immediately retries an internal complement
+- `"[BT]"` is emitted whenever conflict handling changes the live trail and the wrapper resumes search from a backtracked snapshot
 - after `"[BT]"`, the solver replays its surviving assignment trail, prefixing only true external decisions with `"D"`
 - terminal calls emit `"SAT"` or `"UNSAT"`
 
+The replay has mode-specific meaning:
+
+- when `dpll=True`, the replayed trail includes the wrapper's immediate complement retry for the most recent unresolved decision
+- when `dpll=False`, the replayed trail reflects MiniSAT's non-chronological backjump target plus the newly enqueued asserting literal
+
 There is one important API wrinkle: DPLL also uses `step(None)` for the initial root-level propagation trace. The MiniSAT wrapper currently performs that propagation inside construction, so matching DPLL exactly requires a buffered initial token trace that can be returned on the first `step(None)` call.
+
+### Learnt-Clause Token Extension
+
+For `clause_learning=True`, the wrapper should extend the backtrack token stream so the learnt clause becomes observable to Python.
+
+The intended placement is:
+
+- emit `"[BT]"` first
+- emit `"L"` immediately after `"[BT]"` to mark a learnt-clause block
+- emit the learnt clause literals after `"L"`
+- emit the replayed surviving trail after the learnt clause block
+
+The learnt clause block uses the same signed-integer literal encoding as the CNF input and the rest of the trajectory stream:
+
+- each literal in the learnt clause is emitted as one signed-integer token
+- the clause is terminated by the string token `"0"`
+
+A multi-literal learnt clause can therefore appear as:
+
+```python
+["[BT]", "L", -3, 5, "0", "D", 1, -2, 3]
+```
+
+A unit learnt clause uses the same format:
+
+```python
+["[BT]", "L", -1, "0", -1, 2, "SAT"]
+```
+
+These examples mean:
+
+- MiniSAT backtracked
+- it learnt the clause `(-x3 v x5)`
+- it then replayed the surviving live trail, where `1` was an external decision, `-2` was already implied before the conflict, and `3` is the wrapper's internal complement retry
+
+This extension is intentionally a MiniSAT-specific superset of the base DPLL token contract. Exact parity with `src.dpll.DPLL.step()` still applies only to `clause_learning=False, dpll=True`.
+
+Two scope boundaries should be explicit in the documentation:
+
+- this learnt-clause block belongs to any emitted `"[BT]"` segment, regardless of whether the backtrack came from chronological retry (`dpll=True`) or CDCL backjumping (`dpll=False`)
+- the replayed trail after that block still depends on mode: `dpll=True` shows the complement retry, while `dpll=False` shows the backjumped trail with the asserting literal
 
 ### Recommended Public API Change
 
@@ -740,14 +786,14 @@ Recommended changes:
 - change `begin_search()` so it records constructor-time tokens into `pending_initial_tokens_`
 - change `step(...)` so it creates a fresh token buffer for each external call and returns it
 - change `settle(...)` to append new implied literals after each call to `propagate()`
-- change `handle_dpll_conflict(...)` to append `"[BT]"` plus a replayed trail snapshot whenever it flips the latest unresolved decision
-- optionally change `handle_cdcl_conflict(...)` to emit MiniSAT-specific extensions such as learnt clauses via the existing reserved `"L"` token
+- change `handle_cdcl_conflict(...)` so it emits the same `"[BT]"` plus surviving-trail replay shape after a non-chronological backjump and asserting-literal enqueue
+- change `handle_dpll_conflict(...)` so it emits `"[BT]", "L", lit1, lit2, ..., "0"` when `clause_learning=True`, and only then the replayed trail snapshot
 
 ### Extra State The Wrapper Needs
 
-MiniSAT's native trail is not enough to reconstruct the DPLL token stream exactly.
+MiniSAT's native trail is not enough to reconstruct the backtrack token stream exactly.
 
-The current wrapper already stores a `decision_frames_` stack, which is enough for chronological branch flipping. Exact DPLL-style token replay needs two more pieces of wrapper-side state:
+The current wrapper already stores a `decision_frames_` stack, which is enough for chronological branch flipping. Exact backtrack replay needs two more pieces of wrapper-side state:
 
 ```cpp
 std::vector<py::object> pending_initial_tokens_;
@@ -763,12 +809,21 @@ Why `trail_is_external_decision_` is necessary:
 
 Without that metadata, the wrapper cannot faithfully reproduce the `"[BT]", ..., "D", lit, ...` snapshot format from `src.dpll.DPLL`.
 
+To expose learnt clauses on that same path, the wrapper also needs a small transient buffer for the most recently analyzed clause on the active conflict:
+
+```cpp
+std::vector<int> pending_learnt_clause_tokens_;
+```
+
+That buffer should be populated from the `Minisat::vec<Minisat::Lit>` returned by `analyze(...)` only for the duration of the current conflict-handling step. It does not need to become persistent solver state beyond the emitted token stream.
+
 ### Minimal Helper Functions
 
 A clean implementation can stay entirely in the wrapper by adding helpers like:
 
 ```cpp
 void emit_new_propagations(py::list& tokens, int old_trail_size);
+void emit_learnt_clause(TokenBuffer& tokens, const Minisat::vec<Minisat::Lit>& learnt_clause) const;
 void emit_backtrack_snapshot(py::list& tokens) const;
 void cancel_until_with_metadata(int level);
 ```
@@ -776,10 +831,46 @@ void cancel_until_with_metadata(int level);
 Expected responsibilities:
 
 - `emit_new_propagations(...)` scans `trail[old_trail_size:]` after each `propagate()` call, appends the new implied literals in order, and extends `trail_is_external_decision_` with `false` for those new assignments
-- `emit_backtrack_snapshot(...)` appends `"[BT]"` and then replays the current live trail, inserting `"D"` only where `trail_is_external_decision_[i]` is `true`
+- `emit_learnt_clause(...)` appends `"L"`, then each learnt-clause literal in order, and then appends `"0"` as an end-of-clause separator
+- `emit_backtrack_snapshot(...)` replays the current live trail, inserting `"D"` only where `trail_is_external_decision_[i]` is `true`
 - `cancel_until_with_metadata(...)` calls MiniSAT's `cancelUntil(level)` and then shrinks `trail_is_external_decision_` to the new `trail.size()`
 
 This keeps the implementation aligned with the current wrapper architecture in [`minisat/python/minisat_wrapper.cpp`](/home/chengdicao/repos/SATLM/minisat/python/minisat_wrapper.cpp:64) and [`minisat/python/minisat_wrapper.cpp`](/home/chengdicao/repos/SATLM/minisat/python/minisat_wrapper.cpp:326).
+
+### Planned `handle_cdcl_conflict(...)` Flow
+
+The CDCL conflict path should emit the same backtrack marker and surviving-trail replay shape as the DPLL path, even though the recovery policy is different.
+
+The intended sequence is:
+
+1. Call `analyze(confl, learnt_clause, backtrack_level)`.
+2. Undo to `backtrack_level` with `cancel_until_with_metadata(backtrack_level)`.
+3. Enqueue the asserting literal, either directly for a unit learnt clause or via the learnt or ephemeral reason clause for a longer conflict clause.
+4. Mark that asserting literal as non-external in `trail_is_external_decision_`.
+5. Emit `"[BT]"`, then emit `"L", lit1, lit2, ..., "0"` when `clause_learning=True`, and then replay the resulting live trail snapshot.
+6. Return to `settle(...)` so any further implications appear after the replay.
+
+In this mode the replay does not show a complement retry. Instead, it shows the trail that survives MiniSAT's non-chronological backjump together with the freshly asserted literal that resumes propagation. A unit learnt clause therefore appears as `"[BT]", lit, 0, lit, ...`, where the first `lit` belongs to the learnt-clause block and the second `lit` is the same asserting literal replayed on the live trail.
+
+### Planned `handle_dpll_conflict(...)` Flow
+
+The learned-clause token feature belongs in the existing DPLL conflict path because that is where the wrapper already owns chronological undo and trail replay.
+
+The intended sequence is:
+
+1. If `clause_learning=True`, call `analyze(confl, learnt_clause, ignored_backtrack_level)`.
+2. If the learnt clause has more than one literal, keep the current MiniSAT behavior of allocating, attaching, and bumping the learnt clause.
+3. Start the emitted backtrack segment with `"[BT]"`.
+4. If `clause_learning=True`, emit the analyzed learnt clause as `"L", lit1, lit2, ..., 0`.
+5. Undo one chronological decision level with `cancel_until_with_metadata(decisionLevel() - 1)`.
+6. If the latest decision has not yet tried its complement, enqueue that complement as an internal non-external assignment.
+7. Replay the surviving trail snapshot, prefixing only original Python-driven decisions with `"D"`.
+8. Return to `settle(...)` so propagation continues from the flipped branch.
+
+Two details matter here:
+
+- the learnt-clause tokens must be emitted before the trail replay so the consumer can interpret them as metadata about the backtrack event rather than as assignments already present on the live trail
+- the complement literal itself should still appear only inside the replayed trail, not inside the learnt-clause block
 
 ### Scope Of Exact Compatibility
 
@@ -787,8 +878,8 @@ Exact token parity should be specified against `clause_learning=False, dpll=True
 
 That is the only mode where the current MiniSAT wrapper is intentionally matching the pure DPLL solver's search behavior. In the other modes:
 
-- `dpll=False` preserves MiniSAT's non-chronological backjumping, so the stream can only be DPLL-like, not identical
-- `clause_learning=True` may reasonably extend the stream with MiniSAT-specific learnt-clause tokens, for example `['L', lit1, lit2, ..., 0]`
+- `dpll=False` now shares the same `"[BT]"` plus surviving-trail replay shape, but the replay encodes MiniSAT's non-chronological backjump rather than DPLL's chronological complement retry
+- `clause_learning=True` can extend each `"[BT]"` segment with a learnt-clause block `"L", lit1, lit2, ..., 0` before the replayed trail
 
 Those modes can still share the same base vocabulary for literals, `"D"`, `"[BT]"`, `"SAT"`, and `"UNSAT"`, but they should be documented as supersets rather than exact replicas of `src.dpll.DPLL`.
 
