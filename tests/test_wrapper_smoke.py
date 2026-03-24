@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import minisat_wrapper
+import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -164,6 +165,79 @@ def test_sat_via_two_steps():
     assert solver.default_branching_literal() is None
     assert solver.decisions == 3
     assert solver.propagations >= 0
+
+
+def test_get_vcg_exports_candidate_variable_clause_graph():
+    solver = minisat_wrapper.MiniSAT([[1, 2], [-1, 2]])
+
+    assert solver.step() == ["D"]
+
+    x, edge_index, edge_attr = solver.get_vcg()
+
+    assert isinstance(x, np.ndarray)
+    assert isinstance(edge_index, np.ndarray)
+    assert isinstance(edge_attr, np.ndarray)
+
+    assert x.dtype == np.float32
+    assert edge_index.dtype == np.int64
+    assert edge_attr.dtype == np.float32
+
+    assert x.shape == (4, 2)
+    assert edge_index.shape == (2, 4)
+    assert edge_attr.shape == (4, 2)
+    assert x.tolist() == [
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+    ]
+
+    edges = sorted(
+        (
+            int(source),
+            int(target),
+            tuple(float(value) for value in attr),
+        )
+        for source, target, attr in zip(edge_index[0], edge_index[1], edge_attr)
+    )
+    assert edges == [
+        (0, 2, (0.0, 1.0)),
+        (0, 3, (1.0, 0.0)),
+        (1, 2, (0.0, 1.0)),
+        (1, 3, (0.0, 1.0)),
+    ]
+
+
+def test_get_vcg_does_not_consume_reserved_default_choice():
+    solver = minisat_wrapper.MiniSAT([[1, 2]])
+
+    assert solver.step() == ["D"]
+    literal = get_default_branch_literal(solver)
+
+    x, edge_index, edge_attr = solver.get_vcg()
+
+    assert x.shape == (3, 2)
+    assert edge_index.shape == (2, 2)
+    assert edge_attr.shape == (2, 2)
+    assert solver.step(literal) == [-1, 2, "SAT"]
+
+
+def test_get_vcg_returns_empty_graph_after_sat():
+    solver = minisat_wrapper.MiniSAT([[1, 2]])
+
+    assert solver.step() == ["D"]
+    assert solver.step(1) == [1, "D"]
+    assert solver.step(2) == [2, "SAT"]
+
+    x, edge_index, edge_attr = solver.get_vcg()
+
+    assert x.dtype == np.float32
+    assert edge_index.dtype == np.int64
+    assert edge_attr.dtype == np.float32
+
+    assert x.shape == (0, 2)
+    assert edge_index.shape == (2, 0)
+    assert edge_attr.shape == (0, 2)
 
 
 def test_default_branching_literal_replays_minisat_choice():

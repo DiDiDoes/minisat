@@ -24,6 +24,7 @@ setup(
     name="minisat-wrapper",
     version="0.1.0",
     description="Step-wise pybind11 wrapper for MiniSAT",
+    install_requires=["numpy"],
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
     zip_safe=False,

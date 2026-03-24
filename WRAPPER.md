@@ -57,6 +57,8 @@ class MiniSAT:
     def propagations(self) -> int: ...
 
     def step(self, literal: int | None = None) -> list[int | str]: ...
+
+    def get_vcg(self) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]: ...
 ```
 
 ## Search Options
@@ -405,6 +407,168 @@ Python should only observe:
 - aggregate search counters
 
 The only internal state that Python does not observe directly but that the wrapper now needs to maintain is the decision-frame stack used for `dpll=True`.
+
+## `get_vcg()`
+
+`get_vcg()` returns a read-only snapshot of the current variable-clause graph for the internal solver state:
+
+```python
+x, edge_index, edge_attr = solver.get_vcg()
+```
+
+It must not mutate solver state, trigger propagation, or consume any pending default branch choice. It should reflect the same quiescent solver snapshot that Python already sees through `state` and `candidates`.
+
+### Return Values
+
+`get_vcg()` returns:
+
+- `x: [N, 2]`
+- `edge_index: [2, E]`
+- `edge_attr: [E, 2]`
+
+Recommended dtypes:
+
+- `x`: `float32`
+- `edge_index`: `int64`
+- `edge_attr`: `float32`
+
+### Node Set
+
+The graph is bipartite and contains variable nodes followed by clause nodes. `x[i]` is a one-hot node-type feature:
+
+- `[1, 0]` means variable node
+- `[0, 1]` means clause node
+
+#### Variable Nodes
+
+The first `V` nodes represent candidate variables only. Use one node per candidate variable, not one node per candidate literal. Derive this prefix from the current `candidates` frontier, deduplicated by absolute variable index while preserving first-appearance order. With the current wrapper behavior, this yields ascending variable order.
+
+Example:
+
+```python
+solver.candidates == [1, -1, 4, -4, 7, -7]
+```
+
+then the variable-node prefix is `x1`, `x4`, `x7` in that order. Non-candidate variables must not appear as nodes even if they still occur in clauses.
+
+#### Clause Nodes
+
+Clause nodes follow the variable-node prefix. Include every clause that is not currently satisfied:
+
+- original clauses from `clauses`
+- learned clauses from `learnts`
+
+For deterministic indexing, iterate original clauses first and learned clauses second, preserving current internal storage order within each group.
+
+Filtering rules:
+
+- skip removed clauses
+- skip satisfied clauses
+- include unresolved clauses
+- include falsified clauses if they are present in a visible UNSAT snapshot
+
+### Edge Set
+
+Each edge represents literal inclusion between a candidate-variable node and an included clause node. Use one directed incidence edge per retained literal occurrence:
+
+- source: variable node
+- target: clause node
+
+Do not duplicate reverse edges in the first version. If a downstream consumer wants an undirected graph, it can symmetrize the result outside the wrapper.
+
+`edge_attr[e]` is the literal-sign one-hot feature:
+
+- `[0, 1]` means positive literal
+- `[1, 0]` means negative literal
+
+Important consequence: if an included clause contains only non-candidate variables, the clause node is still present but contributes no edges. This is intentional because the requested graph excludes non-candidate variable nodes.
+
+### Terminal-State Semantics
+
+`get_vcg()` should be callable in all visible wrapper states.
+
+- when `state == 0`, variable nodes come from the current candidate frontier and clause nodes come from all currently unsatisfied original and learned clauses
+- when `state == 10`, there are no candidate variables and all clauses should be satisfied, so the expected result is an empty graph with shapes `(0, 2)`, `(2, 0)`, and `(0, 2)`
+- when `state == 20`, the variable-node prefix is empty and clause nodes represent all clauses still unsatisfied in the terminal snapshot
+
+## VCG Implementation Plan
+
+The current wrapper structure is a good fit for this feature because `PyMiniSAT` privately inherits `Minisat::Solver` and can inspect `candidates_`, `clauses`, `learnts`, `ca`, `isRemoved(...)`, and `satisfied(...)` directly. The VCG should be assembled on demand when `get_vcg()` is called rather than cached across search steps.
+
+### 1. Add the Binding Entry Point
+
+- add `#include <pybind11/numpy.h>` in `python/minisat_wrapper.cpp`
+- add `py::tuple get_vcg() const;` to `PyMiniSAT`
+- bind it with `.def("get_vcg", &PyMiniSAT::get_vcg)`
+
+NumPy arrays are the right surface here because the requested API is shape-oriented and is meant for external graph tooling.
+
+### 2. Build the Candidate-Variable Prefix
+
+Implement a helper that walks `candidates_`, deduplicates by absolute variable index, and records a node id for each retained candidate variable. A simple representation is:
+
+```cpp
+std::vector<int> candidate_variables;
+std::vector<int> var_to_node(nVars(), -1);
+```
+
+This keeps `get_vcg()` exactly aligned with the wrapper current notion of branchable variables instead of recomputing branchability independently.
+
+### 3. Collect Included Clauses
+
+Scan `clauses` first and `learnts` second. For each `CRef cr`:
+
+1. skip it if `isRemoved(cr)`
+2. read `Clause& clause = ca[cr]`
+3. skip it if `satisfied(clause)`
+4. otherwise assign the next clause-node id
+
+This uses MiniSAT own live-clause and satisfaction checks, which is safer than reconstructing clause state in wrapper code.
+
+### 4. Emit Node Features
+
+After counting `V` candidate-variable nodes and `C` clause nodes, allocate `x` with shape `[V + C, 2]`, fill rows `[0, V)` with `[1, 0]`, and fill rows `[V, V + C)` with `[0, 1]`. No additional node features are needed in the first version.
+
+### 5. Emit Literal-Incidence Edges
+
+For every included clause node, iterate through its literals. For each literal:
+
+1. compute `var = Minisat::var(lit)`
+2. look up `node = var_to_node[var]`
+3. skip it if `node == -1`
+4. append one edge from `node` to the clause node
+5. append `[0, 1]` for a positive literal or `[1, 0]` for a negative literal
+
+This yields `edge_index: [2, E]` and `edge_attr: [E, 2]`, where `E` is the number of retained candidate-variable literal occurrences across all included clauses.
+
+### 6. Materialize NumPy Arrays
+
+Use flat C++ buffers and copy them into `py::array_t` values:
+
+- `std::vector<float>` for `x`
+- `std::vector<std::int64_t>` for `edge_index`
+- `std::vector<float>` for `edge_attr`
+
+Return them as `py::make_tuple(x_array, edge_index_array, edge_attr_array)`. A zero-copy design is not necessary because this graph is a fresh snapshot.
+
+### 7. Packaging Follow-Up
+
+If `get_vcg()` returns NumPy arrays, the package should declare NumPy as a runtime dependency in addition to the existing `pybind11` build dependency. That change belongs in packaging metadata, not in MiniSAT logic, but it should be part of the implementation checklist.
+
+### 8. Test Plan
+
+Add wrapper-level tests that verify both shape and content:
+
+- unresolved state: candidate variables appear first, node features match the requested one-hot encoding, only unsatisfied clauses are included, and edge signs match literal polarity
+- SAT state: returns empty arrays with shapes `(0, 2)`, `(2, 0)`, and `(0, 2)`
+- UNSAT state: returns clause nodes for unsatisfied clauses and an empty variable-node prefix
+- learned-clause case with `clause_learning=True`: at least one learned clause appears after original clauses
+
+The tests should assert deterministic ordering because downstream graph consumers will often rely on stable node indexing.
+
+### 9. Complexity and Caching
+
+`get_vcg()` should remain an on-demand snapshot. The candidate frontier, clause satisfaction, and learned database can all change after each `step`, so caching would add invalidation complexity without much benefit. The expected cost per call is linear in the number of candidate literals inspected, live clauses scanned, and exported literal incidences.
 
 ## Binding Options
 

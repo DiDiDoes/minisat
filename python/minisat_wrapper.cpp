@@ -1,3 +1,4 @@
+#include <array>
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -7,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -130,6 +132,94 @@ public:
         trail_is_external_decision_.push_back(true);
         settle(tokens);
         return tokens_to_list(tokens);
+    }
+
+    py::tuple get_vcg() const {
+        std::vector<int> candidate_variables;
+        candidate_variables.reserve(candidates_.size() / 2);
+
+        std::vector<std::int64_t> var_to_node(static_cast<std::size_t>(nVars()), -1);
+        for (int literal : candidates_) {
+            const int variable = std::abs(literal) - 1;
+            if (var_to_node[static_cast<std::size_t>(variable)] != -1)
+                continue;
+            var_to_node[static_cast<std::size_t>(variable)] = static_cast<std::int64_t>(candidate_variables.size());
+            candidate_variables.push_back(variable);
+        }
+
+        std::vector<Minisat::CRef> included_clauses;
+        included_clauses.reserve(static_cast<std::size_t>(clauses.size() + learnts.size()));
+
+        const auto collect_unsatisfied_clauses = [this, &included_clauses](const Minisat::vec<Minisat::CRef>& crefs) {
+            for (int index = 0; index < crefs.size(); ++index) {
+                const Minisat::CRef cr = crefs[index];
+                if (isRemoved(cr))
+                    continue;
+
+                const Minisat::Clause& clause = ca[cr];
+                if (satisfied(clause))
+                    continue;
+
+                included_clauses.push_back(cr);
+            }
+        };
+
+        collect_unsatisfied_clauses(clauses);
+        collect_unsatisfied_clauses(learnts);
+
+        std::vector<std::int64_t> edge_sources;
+        std::vector<std::int64_t> edge_targets;
+        std::vector<float> edge_attr_data;
+        edge_attr_data.reserve(included_clauses.size() * 4);
+
+        const std::int64_t variable_count = static_cast<std::int64_t>(candidate_variables.size());
+        for (std::size_t clause_index = 0; clause_index < included_clauses.size(); ++clause_index) {
+            const Minisat::Clause& clause = ca[included_clauses[clause_index]];
+            const std::int64_t clause_node = variable_count + static_cast<std::int64_t>(clause_index);
+            for (int literal_index = 0; literal_index < clause.size(); ++literal_index) {
+                const Minisat::Lit literal = clause[literal_index];
+                const std::int64_t variable_node = var_to_node[static_cast<std::size_t>(Minisat::var(literal))];
+                if (variable_node == -1)
+                    continue;
+
+                edge_sources.push_back(variable_node);
+                edge_targets.push_back(clause_node);
+                if (Minisat::sign(literal)) {
+                    edge_attr_data.push_back(1.0f);
+                    edge_attr_data.push_back(0.0f);
+                } else {
+                    edge_attr_data.push_back(0.0f);
+                    edge_attr_data.push_back(1.0f);
+                }
+            }
+        }
+
+        const py::ssize_t node_count = static_cast<py::ssize_t>(candidate_variables.size() + included_clauses.size());
+        py::array_t<float> x(std::array<py::ssize_t, 2>{node_count, 2});
+        auto x_view = x.mutable_unchecked<2>();
+        for (py::ssize_t node = 0; node < node_count; ++node) {
+            const bool is_variable = node < variable_count;
+            x_view(node, 0) = is_variable ? 1.0f : 0.0f;
+            x_view(node, 1) = is_variable ? 0.0f : 1.0f;
+        }
+
+        const py::ssize_t edge_count = static_cast<py::ssize_t>(edge_sources.size());
+        py::array_t<std::int64_t> edge_index(std::array<py::ssize_t, 2>{2, edge_count});
+        auto edge_index_view = edge_index.mutable_unchecked<2>();
+        for (py::ssize_t edge = 0; edge < edge_count; ++edge) {
+            edge_index_view(0, edge) = edge_sources[static_cast<std::size_t>(edge)];
+            edge_index_view(1, edge) = edge_targets[static_cast<std::size_t>(edge)];
+        }
+
+        py::array_t<float> edge_attr(std::array<py::ssize_t, 2>{edge_count, 2});
+        auto edge_attr_view = edge_attr.mutable_unchecked<2>();
+        for (py::ssize_t edge = 0; edge < edge_count; ++edge) {
+            const std::size_t offset = static_cast<std::size_t>(edge) * 2;
+            edge_attr_view(edge, 0) = edge_attr_data[offset];
+            edge_attr_view(edge, 1) = edge_attr_data[offset + 1];
+        }
+
+        return py::make_tuple(std::move(x), std::move(edge_index), std::move(edge_attr));
     }
 
 private:
@@ -560,6 +650,7 @@ PYBIND11_MODULE(minisat_wrapper, m) {
         .def_property_readonly("propagations", &PyMiniSAT::propagations_count)
         .def("default_branching_literal", &PyMiniSAT::default_branching_literal)
         .def("pick_default_branch_literal", &PyMiniSAT::pick_default_branch_literal)
+        .def("get_vcg", &PyMiniSAT::get_vcg)
         .def("step", &PyMiniSAT::step, py::arg("literal") = py::none());
 
     m.attr("STATE_UNRESOLVED") = py::int_(kStateUnresolved);
