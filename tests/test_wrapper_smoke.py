@@ -66,6 +66,26 @@ def run_wrapper_with_default_branching(path: Path):
     }
 
 
+def run_wrapper_with_step_done(
+    path: Path,
+    *,
+    clause_learning: bool = True,
+    dpll: bool = False,
+):
+    solver = minisat_wrapper.MiniSAT(
+        parse_dimacs(path),
+        clause_learning=clause_learning,
+        dpll=dpll,
+    )
+    if solver.state == minisat_wrapper.STATE_UNRESOLVED:
+        solver.step_done()
+    return solver.state, {
+        "conflicts": solver.conflicts,
+        "decisions": solver.decisions,
+        "propagations": solver.propagations,
+    }
+
+
 def run_wrapper_with_default_branching_subprocess(
     path: Path,
     *,
@@ -165,6 +185,45 @@ def test_sat_via_two_steps():
     assert solver.default_branching_literal() is None
     assert solver.decisions == 3
     assert solver.propagations >= 0
+
+
+def test_step_done_none_finishes_search_and_discards_initial_tokens():
+    solver = minisat_wrapper.MiniSAT([[1, 2]])
+
+    solver.step_done()
+
+    assert solver.state == minisat_wrapper.STATE_SAT
+    assert solver.candidates == []
+    assert solver.default_branching_literal() is None
+    assert solver.decisions == 2
+
+    with pytest.raises(RuntimeError):
+        solver.step()
+
+
+def test_step_done_literal_finishes_search():
+    solver = minisat_wrapper.MiniSAT([[1, 2]])
+
+    solver.step_done(1)
+
+    assert solver.state == minisat_wrapper.STATE_SAT
+    assert solver.candidates == []
+    assert solver.default_branching_literal() is None
+    assert solver.decisions == 3
+
+
+def test_step_done_none_uses_reserved_default_branch_choice():
+    solver = minisat_wrapper.MiniSAT([[1, 2]])
+    assert solver.step() == ["D"]
+
+    literal = get_default_branch_literal(solver)
+    assert literal in solver.candidates
+
+    solver.step_done()
+
+    assert solver.state == minisat_wrapper.STATE_SAT
+    assert solver.candidates == []
+    assert solver.default_branching_literal() is None
 
 
 def test_get_vcg_exports_candidate_variable_clause_graph():
@@ -334,6 +393,27 @@ def test_default_branching_matches_native_solver_on_unsat_example():
 
     assert native_status == 20
     assert wrapper_state == minisat_wrapper.STATE_UNSAT
+    assert wrapper_stats == native_stats
+
+
+@pytest.mark.parametrize(
+    ("filename", "native_status", "wrapper_state"),
+    [
+        ("v5c24_sat.cnf", 10, minisat_wrapper.STATE_SAT),
+        ("v5c24_unsat.cnf", 20, minisat_wrapper.STATE_UNSAT),
+    ],
+)
+def test_step_done_matches_native_solver_on_examples(
+    filename: str,
+    native_status: int,
+    wrapper_state: int,
+):
+    path = EXAMPLES_DIR / filename
+    expected_native_status, native_stats = run_native_solver(path)
+    observed_wrapper_state, wrapper_stats = run_wrapper_with_step_done(path)
+
+    assert expected_native_status == native_status
+    assert observed_wrapper_state == wrapper_state
     assert wrapper_stats == native_stats
 
 

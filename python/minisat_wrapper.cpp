@@ -111,27 +111,32 @@ public:
         const int requested_literal = literal.cast<int>();
 
         TokenBuffer tokens;
-        Minisat::Lit choice = Minisat::lit_Undef;
-        if (has_reserved_default_choice_) {
-            if (requested_literal != encode_literal(reserved_default_choice_))
-                throw std::invalid_argument("literal does not match the reserved default branching literal");
-            choice = reserved_default_choice_;
-            reserved_default_choice_ = Minisat::lit_Undef;
-            has_reserved_default_choice_ = false;
-        } else {
-            if (!is_candidate(requested_literal))
-                throw std::invalid_argument("literal is not a valid branching candidate");
-            choice = decode_existing_literal(requested_literal);
-        }
+        const Minisat::Lit choice = resolve_external_choice(requested_literal);
         decisions++;
-        if (dpll_)
-            decision_frames_.push_back(DecisionFrame{choice, false});
-        emit_token(tokens, requested_literal);
-        newDecisionLevel();
-        uncheckedEnqueue(choice);
-        trail_is_external_decision_.push_back(true);
-        settle(tokens);
+        emit_token(&tokens, requested_literal);
+        enqueue_choice(choice, true);
+        settle(&tokens, true);
         return tokens_to_list(tokens);
+    }
+
+    void step_done(py::object literal = py::none()) {
+        if (state_ != kStateUnresolved)
+            throw std::runtime_error("step_done() is only valid while the solver is unresolved");
+
+        // `step_done()` does not expose the buffered initial trace. Once the
+        // caller asks to finish the solve, discard any pending constructor-time
+        // tokens so a later `step()` call cannot replay stale output.
+        initial_tokens_consumed_ = true;
+        pending_initial_tokens_.clear();
+
+        if (!literal.is_none()) {
+            const int requested_literal = literal.cast<int>();
+            const Minisat::Lit choice = resolve_external_choice(requested_literal);
+            decisions++;
+            enqueue_choice(choice, true);
+        }
+
+        settle(nullptr, false);
     }
 
     py::tuple get_vcg() const {
@@ -252,16 +257,20 @@ private:
         return Minisat::mkLit(variable, literal < 0);
     }
 
-    static void emit_token(TokenBuffer& tokens, int literal) {
-        tokens.push_back(py::int_(literal));
+    static void emit_token(TokenBuffer* tokens, int literal) {
+        if (tokens == nullptr)
+            return;
+        tokens->push_back(py::int_(literal));
     }
 
-    static void emit_token(TokenBuffer& tokens, Minisat::Lit literal) {
+    static void emit_token(TokenBuffer* tokens, Minisat::Lit literal) {
         emit_token(tokens, encode_literal(literal));
     }
 
-    static void emit_token(TokenBuffer& tokens, const char* token) {
-        tokens.push_back(py::str(token));
+    static void emit_token(TokenBuffer* tokens, const char* token) {
+        if (tokens == nullptr)
+            return;
+        tokens->push_back(py::str(token));
     }
 
     static py::list tokens_to_list(const TokenBuffer& tokens) {
@@ -374,6 +383,43 @@ private:
         return make_literal_unchecked(literal);
     }
 
+    void clear_reserved_default_choice() {
+        reserved_default_choice_ = Minisat::lit_Undef;
+        has_reserved_default_choice_ = false;
+    }
+
+    Minisat::Lit resolve_external_choice(int requested_literal) {
+        if (has_reserved_default_choice_) {
+            if (requested_literal != encode_literal(reserved_default_choice_))
+                throw std::invalid_argument("literal does not match the reserved default branching literal");
+            const Minisat::Lit choice = reserved_default_choice_;
+            clear_reserved_default_choice();
+            return choice;
+        }
+
+        if (!is_candidate(requested_literal))
+            throw std::invalid_argument("literal is not a valid branching candidate");
+        return decode_existing_literal(requested_literal);
+    }
+
+    Minisat::Lit pick_internal_choice() {
+        if (has_reserved_default_choice_) {
+            const Minisat::Lit choice = reserved_default_choice_;
+            clear_reserved_default_choice();
+            return choice;
+        }
+
+        return pick_default_branch_lit();
+    }
+
+    void enqueue_choice(Minisat::Lit choice, bool external) {
+        if (dpll_)
+            decision_frames_.push_back(DecisionFrame{choice, false});
+        newDecisionLevel();
+        uncheckedEnqueue(choice);
+        trail_is_external_decision_.push_back(external);
+    }
+
     void load_cnf(const std::vector<std::vector<int>>& cnf) {
         int max_variable = 0;
         for (const auto& clause : cnf) {
@@ -413,7 +459,7 @@ private:
 
         if (!okay()) {
             set_unsat_state();
-            emit_token(pending_initial_tokens_, "UNSAT");
+            emit_token(&pending_initial_tokens_, "UNSAT");
             return;
         }
 
@@ -425,7 +471,7 @@ private:
         learntsize_adjust_confl = learntsize_adjust_start_confl;
         learntsize_adjust_cnt = static_cast<int>(learntsize_adjust_confl);
 
-        settle(pending_initial_tokens_);
+        settle(&pending_initial_tokens_, true);
     }
 
     bool is_candidate(int literal) const {
@@ -469,21 +515,21 @@ private:
         trail_is_external_decision_.resize(static_cast<std::size_t>(trail.size()));
     }
 
-    void emit_new_propagations(TokenBuffer& tokens, int old_trail_size) {
+    void emit_new_propagations(TokenBuffer* tokens, int old_trail_size) {
         for (int index = old_trail_size; index < trail.size(); ++index) {
             trail_is_external_decision_.push_back(false);
             emit_token(tokens, trail[index]);
         }
     }
 
-    void emit_learnt_clause(TokenBuffer& tokens, const Minisat::vec<Minisat::Lit>& learnt_clause) const {
+    void emit_learnt_clause(TokenBuffer* tokens, const Minisat::vec<Minisat::Lit>& learnt_clause) const {
         emit_token(tokens, "L");
         for (int index = 0; index < learnt_clause.size(); ++index)
             emit_token(tokens, learnt_clause[index]);
         emit_token(tokens, "0");
     }
 
-    void emit_backtrack_snapshot(TokenBuffer& tokens) const {
+    void emit_backtrack_snapshot(TokenBuffer* tokens) const {
         for (int index = 0; index < trail.size(); ++index) {
             if (trail_is_external_decision_[static_cast<std::size_t>(index)])
                 emit_token(tokens, "D");
@@ -491,7 +537,7 @@ private:
         }
     }
 
-    void emit_backtrack_event(TokenBuffer& tokens, const Minisat::vec<Minisat::Lit>* learnt_clause = nullptr) const {
+    void emit_backtrack_event(TokenBuffer* tokens, const Minisat::vec<Minisat::Lit>* learnt_clause = nullptr) const {
         emit_token(tokens, "[BT]");
         if (learnt_clause != nullptr)
             emit_learnt_clause(tokens, *learnt_clause);
@@ -509,7 +555,7 @@ private:
         }
     }
 
-    void handle_cdcl_conflict(Minisat::CRef confl, TokenBuffer& tokens) {
+    void handle_cdcl_conflict(Minisat::CRef confl, TokenBuffer* tokens) {
         int backtrack_level = 0;
         Minisat::vec<Minisat::Lit> learnt_clause;
         analyze(confl, learnt_clause, backtrack_level);
@@ -542,7 +588,7 @@ private:
         apply_conflict_heuristics();
     }
 
-    void handle_dpll_conflict(Minisat::CRef confl, TokenBuffer& tokens) {
+    void handle_dpll_conflict(Minisat::CRef confl, TokenBuffer* tokens) {
         Minisat::vec<Minisat::Lit> learnt_clause;
         if (clause_learning_) {
             int ignored_backtrack_level = 0;
@@ -581,7 +627,7 @@ private:
         emit_token(tokens, "UNSAT");
     }
 
-    void settle(TokenBuffer& tokens) {
+    void settle(TokenBuffer* tokens, bool stop_at_branch) {
         if (!search_initialized_)
             throw std::runtime_error("internal error: search used before initialization");
 
@@ -625,6 +671,20 @@ private:
                 return;
             }
 
+            if (!stop_at_branch) {
+                decisions++;
+                const Minisat::Lit next = pick_internal_choice();
+                if (next == Minisat::lit_Undef) {
+                    store_model();
+                    state_ = kStateSat;
+                    emit_token(tokens, "SAT");
+                    return;
+                }
+
+                enqueue_choice(next, false);
+                continue;
+            }
+
             state_ = kStateUnresolved;
             emit_token(tokens, "D");
             return;
@@ -651,6 +711,7 @@ PYBIND11_MODULE(minisat_wrapper, m) {
         .def("default_branching_literal", &PyMiniSAT::default_branching_literal)
         .def("pick_default_branch_literal", &PyMiniSAT::pick_default_branch_literal)
         .def("get_vcg", &PyMiniSAT::get_vcg)
+        .def("step_done", &PyMiniSAT::step_done, py::arg("literal") = py::none())
         .def("step", &PyMiniSAT::step, py::arg("literal") = py::none());
 
     m.attr("STATE_UNRESOLVED") = py::int_(kStateUnresolved);

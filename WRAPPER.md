@@ -57,6 +57,7 @@ class MiniSAT:
     def propagations(self) -> int: ...
 
     def step(self, literal: int | None = None) -> list[int | str]: ...
+    def step_done(self, literal: int | None = None) -> None: ...
 
     def get_vcg(self) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]: ...
 ```
@@ -188,6 +189,7 @@ These counters should be updated:
 
 - after construction
 - after every call to `step`
+- after every call to `step_done`
 
 When `dpll=True`, the wrapper's automatic complement retries should not increment `decisions`. To stay consistent with MiniSat, they should be treated like implied assignments performed during internal conflict recovery rather than as external branching decisions.
 
@@ -233,7 +235,7 @@ The input `literal` must be one of the values currently present in `candidates`.
    - the solver proves SAT
    - the solver proves UNSAT
    - propagation is complete and a new external branching choice is required
-7. Refresh `state`, `candidates`, `conflicts`, `decisions`, and `propagations`.
+7. Refresh `state`, `conflicts`, `decisions`, and `propagations`, and leave `candidates == []` because the solver is now terminal.
 
 Conflict handling depends on the constructor options:
 
@@ -259,7 +261,55 @@ This keeps the Python API aligned with CDCL behavior:
 - the caller chooses decision literals
 - MiniSAT still owns propagation, learning, backjumping, and termination
 
-When `dpll=True`, the final bullet changes slightly: MiniSAT still owns propagation and termination, but the wrapper replaces MiniSAT's non-chronological backjumping with an explicit chronological branch-flip policy.
+## `step_done(literal=None)`
+
+`step_done(literal: int | None = None) -> None` optionally commits one externally supplied branching literal and then runs the solver all the way to a terminal result without pausing again at later branch points.
+
+This method exists for the "finish the solve and give me the final counters" use case. It does not emit or return any trajectory tokens.
+
+### Precondition
+
+`step_done` may only be called when `state == 0`.
+
+If `literal` is not `None`, it must be one of the values currently present in `candidates`. If not, the wrapper should raise `ValueError`.
+
+If `literal` is `None`, the wrapper should not inject any external decision. It should simply resume from the current settled pause point and let MiniSAT choose all subsequent branch literals internally.
+
+### Execution
+
+`step_done(literal)` should perform the following sequence:
+
+1. Validate that the solver is unresolved and paused at a branch point.
+2. If `literal` is not `None`, validate that it is an allowed branching candidate.
+3. If `literal` is not `None`, push it as the next decision on the MiniSAT trail.
+4. Resume the internal search loop.
+5. Whenever a later branching choice is needed during the same call, use MiniSAT's normal default branching heuristic instead of returning control to Python.
+6. Continue until the solver proves SAT or UNSAT.
+7. Refresh `state`, `candidates`, `conflicts`, `decisions`, and `propagations`.
+
+Conflict handling should still respect the constructor options:
+
+- `clause_learning` still controls whether learnt clauses are retained
+- `dpll` still controls whether conflicts backjump non-chronologically or recover chronologically
+
+`step_done` changes only who chooses future branch literals during that call. It does not change the configured conflict policy.
+
+### Postcondition
+
+After `step_done`, exactly one of these is true:
+
+- `state == 10` and `candidates == []`
+- `state == 20` and `candidates == []`
+
+The method returns `None` and does not expose any intermediate pause points. Because the solver is terminal after this call, `candidates` should be empty.
+
+### Important semantic point
+
+`step_done(None)` from the initial constructor-created pause point should be observationally equivalent to just letting the wrapper's configured solver run to completion on its own. With the default options `clause_learning=True, dpll=False`, this should match ordinary MiniSAT solving behavior.
+
+`step_done(literal)` is the handoff operation: Python chooses one last branch literal, and MiniSAT chooses every later branch until termination.
+
+When `dpll=True`, the ownership split changes slightly: MiniSAT still owns propagation and termination, but the wrapper replaces MiniSAT's non-chronological backjumping with an explicit chronological branch-flip policy.
 
 ## Error Handling
 
@@ -272,10 +322,11 @@ Recommended validation:
 - empty clauses are allowed and should immediately make the solver UNSAT
 - `clause_learning` and `dpll` should be accepted as booleans
 
-Recommended `step` errors:
+Recommended stepping errors:
 
 - raise `RuntimeError` if `step` is called when `state != 0`
-- raise `ValueError` if the requested literal is not in `candidates`
+- raise `RuntimeError` if `step_done` is called when `state != 0`
+- raise `ValueError` if a non-`None` literal requested by `step` or `step_done` is not in `candidates`
 
 ## Implementation Notes
 
@@ -825,6 +876,8 @@ solver.step(1)
 
 if solver.state == 0:
     print(solver.candidates) # next branching frontier
+    solver.step_done(None)   # finish with MiniSAT's default branching heuristic
+    print(solver.conflicts)  # final statistics are now available
 elif solver.state == 10:
     print("SAT")
 else:
@@ -837,6 +890,7 @@ This wrapper defines a controlled CDCL interface:
 
 - Python provides the CNF directly as `list[list[int]]`
 - Python chooses each branching literal through `step(literal)`
+- Python can hand control back permanently through `step_done(literal)` or `step_done(None)`
 - MiniSAT performs all propagation between branch points, with optional learnt-clause insertion
 - `state`, `candidates`, and the solver statistics always describe the fully settled current search position
 - `clause_learning` controls whether conflicts add learnt clauses
@@ -851,7 +905,7 @@ The current wrapper implementation in `minisat/python/minisat_wrapper.cpp` alrea
 - both solvers consume one external branch literal per `step(literal)` call
 - both solvers perform internal chronological complement retries without incrementing `decisions`
 
-What the wrapper does **not** expose yet is the trajectory itself. `src.dpll.DPLL.step()` returns a token list, while the MiniSAT wrapper currently returns `None` and only mutates internal state.
+What the wrapper does **not** expose yet in the current implementation is the trajectory itself. `src.dpll.DPLL.step()` returns a token list, while the MiniSAT wrapper currently only mutates internal state. In the planned API, that tokenized interface belongs to `step(...)`, while `step_done(...)` remains the no-token "run to termination" interface.
 
 ### Backtrack Token Contract
 
@@ -919,6 +973,7 @@ To make token emission part of the contract, the wrapper API should change to:
 ```python
 class MiniSAT:
     def step(self, literal: int | None = None) -> list[int | str]: ...
+    def step_done(self, literal: int | None = None) -> None: ...
 ```
 
 Behavior:
@@ -927,11 +982,14 @@ Behavior:
 - later `step(literal)` calls return the chosen branch literal, all implied literals discovered before the next pause, and the final control token for that pause point
 - calling `step(None)` after the initial buffered trace has been consumed should raise `ValueError`
 - calling `step(...)` after termination should still raise `RuntimeError`
+- `step_done(None)` should resume from the current pause point and run to completion using MiniSAT's own branching heuristic
+- `step_done(literal)` should first commit the supplied literal and then run to completion without returning any token stream
 
 A pybind11-friendly signature is:
 
 ```cpp
 py::list step(py::object literal = py::none());
+void step_done(py::object literal = py::none());
 ```
 
 ### Where To Hook Token Emission In MiniSAT
@@ -940,6 +998,7 @@ The existing wrapper control flow already has the right top-level boundaries:
 
 - constructor: `begin_search()`
 - external branch step: `step(int literal)`
+- finish-to-terminal step: `step_done(py::object literal = py::none())`
 - inner search loop: `settle()`
 - conflict recovery: `handle_cdcl_conflict(...)` and `handle_dpll_conflict(...)`
 
@@ -949,6 +1008,7 @@ Recommended changes:
 
 - change `begin_search()` so it records constructor-time tokens into `pending_initial_tokens_`
 - change `step(...)` so it creates a fresh token buffer for each external call and returns it
+- add `step_done(...)` so it shares the same validation and search machinery but bypasses token buffering and never pauses at a later branch point
 - change `settle(...)` to append new implied literals after each call to `propagate()`
 - change `handle_cdcl_conflict(...)` so it emits the same `"[BT]"` plus surviving-trail replay shape after a non-chronological backjump and asserting-literal enqueue
 - change `handle_dpll_conflict(...)` so it emits `"[BT]", "L", lit1, lit2, ..., "0"` when `clause_learning=True`, and only then the replayed trail snapshot
