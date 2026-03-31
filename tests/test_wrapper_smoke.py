@@ -52,18 +52,61 @@ def get_default_branch_literal(solver):
     return solver.default_branching_literal()
 
 
-def run_wrapper_with_default_branching(path: Path):
-    solver = minisat_wrapper.MiniSAT(parse_dimacs(path))
-    solver.step()
+def run_wrapper_with_default_branching_cnf(
+    cnf,
+    *,
+    clause_learning: bool = True,
+    dpll: bool = False,
+):
+    solver = minisat_wrapper.MiniSAT(
+        cnf,
+        clause_learning=clause_learning,
+        dpll=dpll,
+    )
+    token_count = len(solver.step())
     while solver.state == minisat_wrapper.STATE_UNRESOLVED:
         literal = get_default_branch_literal(solver)
         assert literal in solver.candidates
-        solver.step(literal)
+        token_count += len(solver.step(literal))
     return solver.state, {
         "conflicts": solver.conflicts,
         "decisions": solver.decisions,
         "propagations": solver.propagations,
-    }
+    }, token_count
+
+
+def run_wrapper_with_default_branching(
+    path: Path,
+    *,
+    clause_learning: bool = True,
+    dpll: bool = False,
+):
+    return run_wrapper_with_default_branching_cnf(
+        parse_dimacs(path),
+        clause_learning=clause_learning,
+        dpll=dpll,
+    )
+
+
+def run_wrapper_with_step_done_cnf(
+    cnf,
+    *,
+    clause_learning: bool = True,
+    dpll: bool = False,
+):
+    solver = minisat_wrapper.MiniSAT(
+        cnf,
+        clause_learning=clause_learning,
+        dpll=dpll,
+    )
+    token_count = 0
+    if solver.state == minisat_wrapper.STATE_UNRESOLVED:
+        token_count = solver.step_done()
+    return solver.state, {
+        "conflicts": solver.conflicts,
+        "decisions": solver.decisions,
+        "propagations": solver.propagations,
+    }, token_count
 
 
 def run_wrapper_with_step_done(
@@ -72,18 +115,11 @@ def run_wrapper_with_step_done(
     clause_learning: bool = True,
     dpll: bool = False,
 ):
-    solver = minisat_wrapper.MiniSAT(
+    return run_wrapper_with_step_done_cnf(
         parse_dimacs(path),
         clause_learning=clause_learning,
         dpll=dpll,
     )
-    if solver.state == minisat_wrapper.STATE_UNRESOLVED:
-        solver.step_done()
-    return solver.state, {
-        "conflicts": solver.conflicts,
-        "decisions": solver.decisions,
-        "propagations": solver.propagations,
-    }
 
 
 def run_wrapper_with_default_branching_subprocess(
@@ -190,7 +226,7 @@ def test_sat_via_two_steps():
 def test_step_done_none_finishes_search_and_discards_initial_tokens():
     solver = minisat_wrapper.MiniSAT([[1, 2]])
 
-    assert solver.step_done() == []
+    assert solver.step_done() == 4
 
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
@@ -201,15 +237,11 @@ def test_step_done_none_finishes_search_and_discards_initial_tokens():
         solver.step()
 
 
-def test_step_done_literal_finishes_search():
+def test_step_done_rejects_literal_argument():
     solver = minisat_wrapper.MiniSAT([[1, 2]])
 
-    assert solver.step_done(1) == [1]
-
-    assert solver.state == minisat_wrapper.STATE_SAT
-    assert solver.candidates == []
-    assert solver.default_branching_literal() is None
-    assert solver.decisions == 3
+    with pytest.raises(TypeError):
+        solver.step_done(1)
 
 
 def test_step_done_none_uses_reserved_default_branch_choice():
@@ -219,7 +251,7 @@ def test_step_done_none_uses_reserved_default_branch_choice():
     literal = get_default_branch_literal(solver)
     assert literal in solver.candidates
 
-    assert solver.step_done() == []
+    assert solver.step_done() == 3
 
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
@@ -375,10 +407,41 @@ def test_dpll_can_still_learn_clauses():
     assert solver.decisions == 2
 
 
+@pytest.mark.parametrize(
+    ("clause_learning", "dpll"),
+    [
+        (False, False),
+        (False, True),
+        (True, False),
+        (True, True),
+    ],
+)
+def test_step_done_token_count_matches_tokenized_path_on_backtracking_formula(
+    clause_learning: bool,
+    dpll: bool,
+):
+    cnf = [[1, 2], [1, -2], [-1, 2]]
+
+    step_done_state, step_done_stats, step_done_token_count = run_wrapper_with_step_done_cnf(
+        cnf,
+        clause_learning=clause_learning,
+        dpll=dpll,
+    )
+    tokenized_state, tokenized_stats, tokenized_token_count = run_wrapper_with_default_branching_cnf(
+        cnf,
+        clause_learning=clause_learning,
+        dpll=dpll,
+    )
+
+    assert step_done_state == tokenized_state
+    assert step_done_stats == tokenized_stats
+    assert step_done_token_count == tokenized_token_count
+
+
 def test_default_branching_matches_native_solver_on_sat_example():
     path = EXAMPLES_DIR / "v5c24_sat.cnf"
     native_status, native_stats = run_native_solver(path)
-    wrapper_state, wrapper_stats = run_wrapper_with_default_branching(path)
+    wrapper_state, wrapper_stats, _ = run_wrapper_with_default_branching(path)
 
     assert native_status == 10
     assert wrapper_state == minisat_wrapper.STATE_SAT
@@ -389,7 +452,7 @@ def test_default_branching_matches_native_solver_on_sat_example():
 def test_default_branching_matches_native_solver_on_unsat_example():
     path = EXAMPLES_DIR / "v5c24_unsat.cnf"
     native_status, native_stats = run_native_solver(path)
-    wrapper_state, wrapper_stats = run_wrapper_with_default_branching(path)
+    wrapper_state, wrapper_stats, _ = run_wrapper_with_default_branching(path)
 
     assert native_status == 20
     assert wrapper_state == minisat_wrapper.STATE_UNSAT
@@ -410,11 +473,51 @@ def test_step_done_matches_native_solver_on_examples(
 ):
     path = EXAMPLES_DIR / filename
     expected_native_status, native_stats = run_native_solver(path)
-    observed_wrapper_state, wrapper_stats = run_wrapper_with_step_done(path)
+    observed_wrapper_state, wrapper_stats, token_count = run_wrapper_with_step_done(path)
+    tokenized_wrapper_state, _, expected_token_count = run_wrapper_with_default_branching(path)
 
     assert expected_native_status == native_status
     assert observed_wrapper_state == wrapper_state
+    assert tokenized_wrapper_state == wrapper_state
     assert wrapper_stats == native_stats
+    assert token_count == expected_token_count
+
+
+@pytest.mark.parametrize(
+    ("filename", "wrapper_state", "clause_learning", "dpll"),
+    [
+        ("v5c24_sat.cnf", minisat_wrapper.STATE_SAT, False, False),
+        ("v5c24_sat.cnf", minisat_wrapper.STATE_SAT, False, True),
+        ("v5c24_sat.cnf", minisat_wrapper.STATE_SAT, True, False),
+        ("v5c24_sat.cnf", minisat_wrapper.STATE_SAT, True, True),
+        ("v5c24_unsat.cnf", minisat_wrapper.STATE_UNSAT, False, False),
+        ("v5c24_unsat.cnf", minisat_wrapper.STATE_UNSAT, False, True),
+        ("v5c24_unsat.cnf", minisat_wrapper.STATE_UNSAT, True, False),
+        ("v5c24_unsat.cnf", minisat_wrapper.STATE_UNSAT, True, True),
+    ],
+)
+def test_step_done_token_count_matches_tokenized_path_on_examples_across_options(
+    filename: str,
+    wrapper_state: int,
+    clause_learning: bool,
+    dpll: bool,
+):
+    path = EXAMPLES_DIR / filename
+    step_done_state, step_done_stats, step_done_token_count = run_wrapper_with_step_done(
+        path,
+        clause_learning=clause_learning,
+        dpll=dpll,
+    )
+    tokenized_state, tokenized_stats, tokenized_token_count = run_wrapper_with_default_branching(
+        path,
+        clause_learning=clause_learning,
+        dpll=dpll,
+    )
+
+    assert step_done_state == wrapper_state
+    assert tokenized_state == wrapper_state
+    assert step_done_stats == tokenized_stats
+    assert step_done_token_count == tokenized_token_count
 
 
 @pytest.mark.parametrize(
