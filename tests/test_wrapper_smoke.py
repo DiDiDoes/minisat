@@ -190,7 +190,7 @@ def test_sat_via_two_steps():
 def test_step_done_none_finishes_search_and_discards_initial_tokens():
     solver = minisat_wrapper.MiniSAT([[1, 2]])
 
-    solver.step_done()
+    assert solver.step_done() == []
 
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
@@ -204,7 +204,7 @@ def test_step_done_none_finishes_search_and_discards_initial_tokens():
 def test_step_done_literal_finishes_search():
     solver = minisat_wrapper.MiniSAT([[1, 2]])
 
-    solver.step_done(1)
+    assert solver.step_done(1) == [1]
 
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []
@@ -219,7 +219,7 @@ def test_step_done_none_uses_reserved_default_branch_choice():
     literal = get_default_branch_literal(solver)
     assert literal in solver.candidates
 
-    solver.step_done()
+    assert solver.step_done() == []
 
     assert solver.state == minisat_wrapper.STATE_SAT
     assert solver.candidates == []

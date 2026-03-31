@@ -57,7 +57,7 @@ class MiniSAT:
     def propagations(self) -> int: ...
 
     def step(self, literal: int | None = None) -> list[int | str]: ...
-    def step_done(self, literal: int | None = None) -> None: ...
+    def step_done(self, literal: int | None = None) -> list[int | str]: ...
 
     def get_vcg(self) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]: ...
 ```
@@ -263,9 +263,9 @@ This keeps the Python API aligned with CDCL behavior:
 
 ## `step_done(literal=None)`
 
-`step_done(literal: int | None = None) -> None` optionally commits one externally supplied branching literal and then runs the solver all the way to a terminal result without pausing again at later branch points.
+`step_done(literal: int | None = None) -> list[int | str]` optionally commits one externally supplied branching literal and then runs the solver all the way to a terminal result without pausing again at later branch points.
 
-This method exists for the "finish the solve and give me the final counters" use case. It does not emit or return any trajectory tokens.
+This method exists for the "finish the solve and give me the final counters" use case. It does not emit any internal propagation, backtrack, or terminal tokens. If `literal` is provided, the returned token list contains only that external literal. If `literal` is `None`, it returns `[]`.
 
 ### Precondition
 
@@ -301,7 +301,7 @@ After `step_done`, exactly one of these is true:
 - `state == 10` and `candidates == []`
 - `state == 20` and `candidates == []`
 
-The method returns `None` and does not expose any intermediate pause points. Because the solver is terminal after this call, `candidates` should be empty.
+The method returns either `[]` or `[literal]` and does not expose any intermediate pause points. Because the solver is terminal after this call, `candidates` should be empty.
 
 ### Important semantic point
 
@@ -973,7 +973,7 @@ To make token emission part of the contract, the wrapper API should change to:
 ```python
 class MiniSAT:
     def step(self, literal: int | None = None) -> list[int | str]: ...
-    def step_done(self, literal: int | None = None) -> None: ...
+    def step_done(self, literal: int | None = None) -> list[int | str]: ...
 ```
 
 Behavior:
@@ -982,14 +982,14 @@ Behavior:
 - later `step(literal)` calls return the chosen branch literal, all implied literals discovered before the next pause, and the final control token for that pause point
 - calling `step(None)` after the initial buffered trace has been consumed should raise `ValueError`
 - calling `step(...)` after termination should still raise `RuntimeError`
-- `step_done(None)` should resume from the current pause point and run to completion using MiniSAT's own branching heuristic
-- `step_done(literal)` should first commit the supplied literal and then run to completion without returning any token stream
+- `step_done(None)` should resume from the current pause point and run to completion using MiniSAT's own branching heuristic, returning `[]`
+- `step_done(literal)` should first commit the supplied literal and then run to completion, returning `[literal]` and no further tokens
 
 A pybind11-friendly signature is:
 
 ```cpp
 py::list step(py::object literal = py::none());
-void step_done(py::object literal = py::none());
+py::list step_done(py::object literal = py::none());
 ```
 
 ### Where To Hook Token Emission In MiniSAT
@@ -1008,7 +1008,7 @@ Recommended changes:
 
 - change `begin_search()` so it records constructor-time tokens into `pending_initial_tokens_`
 - change `step(...)` so it creates a fresh token buffer for each external call and returns it
-- add `step_done(...)` so it shares the same validation and search machinery but bypasses token buffering and never pauses at a later branch point
+- add `step_done(...)` so it shares the same validation and search machinery, returns at most the supplied external literal token, and never pauses at a later branch point
 - change `settle(...)` to append new implied literals after each call to `propagate()`
 - change `handle_cdcl_conflict(...)` so it emits the same `"[BT]"` plus surviving-trail replay shape after a non-chronological backjump and asserting-literal enqueue
 - change `handle_dpll_conflict(...)` so it emits `"[BT]", "L", lit1, lit2, ..., "0"` when `clause_learning=True`, and only then the replayed trail snapshot

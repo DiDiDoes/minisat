@@ -119,7 +119,7 @@ public:
         return tokens_to_list(tokens);
     }
 
-    void step_done(py::object literal = py::none()) {
+    py::list step_done(py::object literal = py::none()) {
         if (state_ != kStateUnresolved)
             throw std::runtime_error("step_done() is only valid while the solver is unresolved");
 
@@ -129,14 +129,17 @@ public:
         initial_tokens_consumed_ = true;
         pending_initial_tokens_.clear();
 
+        TokenBuffer tokens;
         if (!literal.is_none()) {
             const int requested_literal = literal.cast<int>();
             const Minisat::Lit choice = resolve_external_choice(requested_literal);
             decisions++;
+            emit_token(&tokens, requested_literal);
             enqueue_choice(choice, true);
         }
 
         settle(nullptr, false);
+        return tokens_to_list(tokens);
     }
 
     py::tuple get_vcg() const {
