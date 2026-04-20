@@ -60,6 +60,7 @@ class MiniSAT:
     def step_done(self) -> int: ...
 
     def get_vcg(self) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]: ...
+    def get_sequence(self) -> list[int | str]: ...
 ```
 
 ## Search Options
@@ -548,6 +549,91 @@ Important consequence: if an included clause contains only non-candidate variabl
 - when `state == 0`, variable nodes come from the current candidate frontier and clause nodes come from all currently unsatisfied original and learned clauses
 - when `state == 10`, there are no candidate variables and all clauses should be satisfied, so the expected result is an empty graph with shapes `(0, 2)`, `(2, 0)`, and `(0, 2)`
 - when `state == 20`, the variable-node prefix is empty and clause nodes represent all clauses still unsatisfied in the terminal snapshot
+
+## `get_sequence()`
+
+`get_sequence()` returns a read-only snapshot of the same solver state as `get_vcg()`, but as a flat token sequence instead of a graph structure:
+
+```python
+tokens = solver.get_sequence()
+```
+
+It must not mutate solver state, trigger propagation, or consume any pending default branch choice. It reflects the same quiescent solver snapshot as `get_vcg()`.
+
+### Return Value
+
+`get_sequence()` returns a `list[int | str]`. The sequence has the following structure:
+
+```
+["[BOS]", <clause_1_literals...>, "0", <clause_2_literals...>, "0", ..., "[SEP]"]
+```
+
+- `"[BOS]"` opens the sequence
+- each clause is represented as its literals in order, followed by the string `"0"` as a clause terminator
+- `"[SEP]"` closes the sequence
+
+Literal encoding uses the same signed-integer convention as the CNF input and the rest of the trajectory stream:
+
+- a positive integer `k` means variable `xk` appears positively in the clause
+- a negative integer `-k` means variable `xk` appears negatively in the clause
+
+### Clause Filtering and Ordering
+
+`get_sequence()` uses exactly the same clause set as `get_vcg()`:
+
+- scan `clauses` first, then `learnts`
+- skip removed clauses
+- skip satisfied clauses
+- include unresolved clauses
+- include falsified clauses present in a visible UNSAT snapshot
+
+This guarantees that the sequence and the graph always describe the same set of clauses in the same order. A consumer that processes both outputs can align clause indices directly.
+
+### Literal Filtering
+
+`get_sequence()` applies the same candidate-variable filter as `get_vcg()`. Within each included clause, only literals whose variable appears in `candidates` are emitted. Literals whose variable is not a candidate are skipped silently.
+
+This means a clause node with no candidate-variable literals still contributes its terminating `"0"` token, producing an empty clause entry `"0"` in the sequence. This mirrors the `get_vcg()` behavior where such a clause node is present but contributes no edges.
+
+### Example
+
+If `get_vcg()` would emit two clause nodes for `x1 ∨ x2` and `¬x1 ∨ ¬x2`, then `get_sequence()` returns:
+
+```python
+["[BOS]", 1, 2, "0", -1, -2, "0", "[SEP]"]
+```
+
+### Terminal-State Semantics
+
+`get_sequence()` should be callable in all visible wrapper states.
+
+- when `state == 0`, the sequence contains all currently unsatisfied original and learned clauses
+- when `state == 10`, all clauses are satisfied, so the sequence is `["[BOS]", "[SEP]"]`
+- when `state == 20`, the sequence contains all clauses still unsatisfied in the terminal snapshot, with no filtering by candidate variables
+
+### Implementation Notes
+
+`get_sequence()` can be implemented as a thin companion to `get_vcg()`. The clause-scanning loop is identical; the difference is that instead of recording node ids and edges, each included clause emits its literals directly into a `std::vector<py::object>`.
+
+- allocate the output vector
+- push `"[BOS]"`
+- for each included clause, push each literal as a signed int, then push `"0"`
+- push `"[SEP]"`
+- return the vector as a `py::list`
+
+The pybind11 binding is:
+
+```cpp
+py::list get_sequence() const;
+```
+
+bound with:
+
+```cpp
+.def("get_sequence", &PyMiniSAT::get_sequence)
+```
+
+No NumPy dependency is introduced by this method.
 
 ## VCG Implementation Plan
 

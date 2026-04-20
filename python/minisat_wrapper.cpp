@@ -224,6 +224,39 @@ public:
         return py::make_tuple(std::move(x), std::move(edge_index), std::move(edge_attr));
     }
 
+    py::list get_sequence() const {
+        std::vector<bool> is_candidate_var(static_cast<std::size_t>(nVars()), false);
+        for (int literal : candidates_)
+            is_candidate_var[static_cast<std::size_t>(std::abs(literal) - 1)] = true;
+
+        py::list result;
+        result.append(py::str("[BOS]"));
+
+        const auto emit_unsatisfied_clauses = [&](const Minisat::vec<Minisat::CRef>& crefs) {
+            for (int index = 0; index < crefs.size(); ++index) {
+                const Minisat::CRef cr = crefs[index];
+                if (isRemoved(cr))
+                    continue;
+                const Minisat::Clause& clause = ca[cr];
+                if (satisfied(clause))
+                    continue;
+                for (int lit_index = 0; lit_index < clause.size(); ++lit_index) {
+                    const Minisat::Lit lit = clause[lit_index];
+                    if (!is_candidate_var[static_cast<std::size_t>(Minisat::var(lit))])
+                        continue;
+                    result.append(py::int_(encode_literal(lit)));
+                }
+                result.append(py::str("0"));
+            }
+        };
+
+        emit_unsatisfied_clauses(clauses);
+        emit_unsatisfied_clauses(learnts);
+
+        result.append(py::str("[SEP]"));
+        return result;
+    }
+
 private:
     using TokenBuffer = std::vector<py::object>;
 
@@ -721,6 +754,7 @@ PYBIND11_MODULE(minisat_wrapper, m) {
         .def("default_branching_literal", &PyMiniSAT::default_branching_literal)
         .def("pick_default_branch_literal", &PyMiniSAT::pick_default_branch_literal)
         .def("get_vcg", &PyMiniSAT::get_vcg)
+        .def("get_sequence", &PyMiniSAT::get_sequence)
         .def("step_done", &PyMiniSAT::step_done)
         .def("step", &PyMiniSAT::step, py::arg("literal") = py::none());
 
